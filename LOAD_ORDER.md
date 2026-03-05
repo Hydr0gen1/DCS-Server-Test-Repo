@@ -8,100 +8,188 @@ Use a separate trigger action per file with incrementing **Time More** values.
 | Script | Source | Required? |
 |---|---|---|
 | `mist.lua` | [MIST GitHub](https://github.com/mrSkortch/MissionScriptingTools) | **Yes** |
+| `ctld.lua` | [ciribob CTLD](https://github.com/ciribob/DCS-CTLD) | No — but strongly recommended |
 | `iads_v1_r37.lua` | [Hoggit IADS Docs](https://wiki.hoggitworld.com/view/IADScript_Documentation) | No (IADS features) |
-| `ctld.lua` | [ciribob CTLD](https://github.com/ciribob/DCS-CTLD) | No (CTLD features) |
 | `ArtilleryEnhancement.lua` | ED Forums (Grimes) | No (enhanced arty AI) |
+
+Audio files required by CTLD: `beacon.ogg`, `beaconsilent.ogg` — add to mission archive.
 
 ## Trigger Setup
 
-Create one trigger per row.  All are **ONCE / Time More**.
+Create one trigger per row. All are **ONCE / Time More**.
 
 ```
 Time  Action               File
-────  ───────────────────  ───────────────────────────────────────
+────  ───────────────────  ─────────────────────────────────────────────
  1 s  DO SCRIPT FILE       mist.lua
- 2 s  DO SCRIPT FILE       iads_v1_r37.lua          (optional)
- 3 s  DO SCRIPT FILE       ctld.lua                 (optional)
- 4 s  DO SCRIPT FILE       ArtilleryEnhancement.lua (optional)
+ 2 s  DO SCRIPT FILE       iads_v1_r37.lua              (optional)
+ 3 s  DO SCRIPT FILE       ctld.lua                     (optional)
+ 4 s  DO SCRIPT FILE       ArtilleryEnhancement.lua     (optional)
  5 s  DO SCRIPT FILE       scripts/utils.lua
  6 s  DO SCRIPT FILE       scripts/config.lua
  7 s  DO SCRIPT FILE       scripts/iads_manager.lua
  8 s  DO SCRIPT FILE       scripts/suppression.lua
  9 s  DO SCRIPT FILE       scripts/ctld_config.lua
-10 s  DO SCRIPT FILE       scripts/artillery_manager.lua
-11 s  DO SCRIPT FILE       scripts/server_core.lua
+10 s  DO SCRIPT FILE       scripts/ctld_logistics.lua
+11 s  DO SCRIPT FILE       scripts/artillery_manager.lua
+12 s  DO SCRIPT FILE       scripts/server_core.lua
 ```
 
-> **Tip:** Place all `.lua` files in the same folder as your `.miz` file, or
-> use absolute paths if your server has a fixed Saved Games directory.
+> **Tip:** Place all `.lua` files in the same folder as your `.miz`, or use
+> absolute paths if the server has a fixed Saved Games directory.
 
 ## Minimum Viable Load (no external scripts)
 
-If you only have MIST and want suppression + built-in counter-battery:
+Suppression + built-in counter-battery only:
 
 ```
 1 s   mist.lua
 5 s   scripts/utils.lua
 6 s   scripts/config.lua
 8 s   scripts/suppression.lua
-10 s  scripts/artillery_manager.lua
-11 s  scripts/server_core.lua
+11 s  scripts/artillery_manager.lua
+12 s  scripts/server_core.lua
 ```
 
-Modules not loaded will be silently skipped by `server_core.lua`.
+Modules not loaded are silently skipped by `server_core.lua`.
 
-## Configuration Checklist
+## Configuration Checklist (`scripts/config.lua`)
 
-After installing, edit **`scripts/config.lua`**:
+| Section | Key things to fill in |
+|---|---|
+| `cfg.iads` | `redPrefixes` — SAM group name prefixes |
+| `cfg.ctld` | `blueTransports`, `bluePickupZones`, `blueDropZones` |
+| `cfg.artillery` | `blueBatteries`, `blueSpotters`, `blueRadars` |
+| `cfg.logistics` | `blueHQZones`, convoy templates, `batteryStartingRounds` |
 
-1. **IADS** — add your SAM group name prefixes to `cfg.iads.redPrefixes`
-2. **Suppression** — adjust `baseHoldTime` / `maxHoldTime` to taste
-3. **CTLD** — add helicopter unit names and trigger zone names
-4. **Artillery** — add battery group names, spotter unit names, radar unit names
+## CTLD Zone Setup (Mission Editor)
 
-## Cross-System Integration Map
+For each zone listed in `cfg.ctld.*Zones`, create a **Trigger Zone** in the ME
+with the exact same name. Zones needed:
+
+| Purpose | Config key | Example zone name |
+|---|---|---|
+| Troops & crates available | `bluePickupZones` | `CTLD_Blue_Pickup_1` |
+| Troop unload / FOB site | `blueDropZones` | `CTLD_Blue_Drop_1` |
+| Troop patrol objective | `blueWaypointZones` | `CTLD_Blue_WP_1` |
+| Supply convoy origin | `blueHQZones` | `Blue_HQ_Zone_1` |
+
+## Logistics System Overview
+
+### Battery Ammo Pool
+- Each battery starts with `batteryStartingRounds` rounds.
+- Every `artillery_manager.fireMission()` call deducts from the pool.
+- A battery at zero rounds ("Winchester") refuses further fire missions.
+- Any supply truck (`M-818`, `KAMAZ`, `Ural-375`) within
+  `supplyRadiusBattery` metres auto-resupplies the battery on the
+  next 60-second poll.
+
+### Supply Convoys
+1. Player opens **F10 → Logistics → Dispatch Convoy → From \<HQ Zone\>**
+2. A clone of the convoy template group spawns at the HQ zone and drives
+   toward the nearest known FOB (or first drop zone as fallback).
+3. On arrival it resupplies all batteries within `supplyRadiusFOB` metres.
+4. If the convoy is destroyed en route, no resupply occurs.
+
+### FOB Construction
+1. CTLD pilots fly crates to a drop zone — `fobCratesRequired` crates needed.
+2. After `fobBuildTime` seconds ciribob's script assembles the FOB.
+3. `ctld_logistics` detects the new static object and records the FOB.
+4. The FOB appears in **F10 → Logistics → FOB Status**.
+5. Subsequent convoys can use the FOB as a resupply waypoint.
+
+### JTAC Crate → Artillery Spotter
+1. A JTAC crate (Hummer JTAC / SKP-11 / MQ-9 drone) is flown out and dropped.
+2. After `jtacScanDelay` seconds the area is scanned for the assembled unit.
+3. The found unit is registered with `ArtilleryEnhancement:addSpotter()` and
+   `artillery_manager.addSpotter()` so it can direct counter-battery missions.
+4. Appears in **F10 → Logistics → JTAC Status**.
+
+### Deployed SAM → IADS Auto-Registration
+1. A SAM-system crate (HAWK, Patriot, BUK, KUB, S-300, etc.) is assembled.
+2. After `samBuildDelay` seconds the area is scanned for units with SAM
+   radar attributes.
+3. The found group is added to the IADS network via `iads.add()`.
+4. IADS then manages its radar behaviour at the configured threat level.
+
+### Pilot Extraction Zones
+- When a player aircraft is killed, `ctld.createExtractZone()` is called
+  at the crash site.
+- CTLD-equipped helicopters can use the standard CTLD extract menu to
+  recover the pilot.
+
+## Full Cross-System Integration Map
 
 ```
 SEAD missile fired
   └─► iads_manager: SAM scatters + radar off (Smarter SAM)
-        └─► suppression: if SAM group also takes a hit,
-                         dark window is extended further
+        └─► suppression: hit while evading → dark window extended
 
 Ground unit hit
   └─► suppression: ROE → WEAPON_HOLD for baseHoldTime
-        └─► iads_manager: if the unit is a SEAD-evading SAM,
-                           dark window extended
+        └─► iads_manager: SAM hit while evading → dark window extended
 
-Artillery shell fires
-  └─► artillery_manager: battery records lastFired
-        └─► displacement timer starts
+Artillery fired
+  └─► artillery_manager: records shot, starts displacement timer
+  └─► logistics: deducts rounds from battery pool
+        └─► if Winchester: fire mission blocked, player notified
 
-Artillery shell impacts a unit
+Artillery shell impacts
   └─► artillery_manager: CB radar detects origin
-        ├─► suppression: units near impact suppressed (cbHoldTime)
-        ├─► ctld_config: warns if drop zone is within 2 km
+        ├─► suppression: units near impact suppressed
+        ├─► ctld_logistics: warns if CTLD drop zone within 2 km
         └─► artillery_manager: nearest friendly battery fires CB mission
 
-CTLD troop drop (ciribob or fallback)
+Supply truck near battery (every 60 s poll)
+  └─► logistics: battery ammo restored if rounds < max
+
+Supply convoy arrives at FOB
+  └─► logistics: all batteries within supplyRadiusFOB resupplied
+
+CTLD troop drop
   └─► ctld_config: onTroopDropHook
         └─► suppression: enemies within 500 m suppressed 20 s
+
+CTLD SAM crate assembled (samBuildDelay after drop)
+  └─► ctld_logistics: area scanned for SAM units
+        └─► iads_manager: new SAM group added to IADS network
+
+CTLD JTAC crate assembled (jtacScanDelay after drop)
+  └─► ctld_logistics: area scanned for JTAC unit
+        ├─► ArtilleryEnhancement: addSpotter()
+        └─► artillery_manager: addSpotter()
+
+Player aircraft killed
+  └─► ctld_logistics: extraction zone created at crash site
 ```
 
-## F10 Admin Menu (BLUE coalition)
-
-Enable with `cfg.admin.f10MenuBlue = true` in `config.lua`.
+## F10 Menu Layout
 
 ```
-[ADMIN] Server Core
+[ADMIN] Server Core          (BLUE coalition, admin only)
   ├── IADS
   │     ├── Status
-  │     ├── Set level 1 / 2 / 3 / 4
+  │     └── Set level 1 / 2 / 3 / 4
   ├── Suppression
   │     ├── Status
   │     └── Toggle on/off
   ├── Artillery
   │     ├── Battery Status
   │     └── Pending CB Shells
-  └── CTLD
-        └── Lift Manifest
+  ├── CTLD
+  │     └── Lift Manifest
+  └── Logistics
+        ├── Ammo Summary
+        └── FOB / Convoy Status
+
+Logistics                    (BLUE coalition, all players)
+  ├── Ammo Status
+  ├── FOB Status
+  ├── JTAC Status
+  ├── Dispatch Convoy
+  │     └── From <HQ Zone 1>  …
+  └── Convoy Status
+
+CTLD                         (built-in ciribob F10 menus)
+  └── (standard CTLD menu — Actions, Load, Unload, Crates, etc.)
 ```

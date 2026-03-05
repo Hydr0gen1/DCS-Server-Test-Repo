@@ -1,18 +1,20 @@
 -- =============================================================
 -- ctld_config.lua
--- Combined Arms Troop Load / Drop integration.
+-- Configures ciribob's CTLD (Complete Troops and Logistics
+-- Deployment) using the real ctld.lua API, and provides a
+-- lightweight MIST-based fallback when ctld.lua is absent.
 --
--- PRIMARY MODE  — Configures ciribob's ctld.lua when it is
---                 already loaded (recommended for full feature set).
---                 https://github.com/ciribob/DCS-CTLD
+-- LOAD ORDER: after mist.lua and ctld.lua (see LOAD_ORDER.md)
+-- GitHub: https://github.com/ciribob/DCS-CTLD
 --
--- FALLBACK MODE — A lightweight MIST-based troop-spawn system
---                 used automatically when ctld.lua is absent.
---                 Supports infantry drops from grounded helicopters
---                 using late-activated ME group templates.
+-- Zone table format (ciribob API):
+--   pickupZone: { zoneName, smokeColor, limit, "active"|"no", side, [flagNum] }
+--   dropZone:   { zoneName, smokeColor, side }
+--   wayptZone:  { zoneName, smokeColor, "active"|"no", side }
 --
--- Dependencies (primary):  ctld.lua, mist.lua
--- Dependencies (fallback):  mist.lua
+--   smokeColor: "green" "red" "blue" "orange" "white" -1/"none"
+--   limit:  -1 = unlimited,  0-20 = max groups available at zone
+--   side:    0 = both,  1 = RED,  2 = BLUE
 -- =============================================================
 
 DCSCore      = DCSCore or {}
@@ -21,32 +23,83 @@ DCSCore.ctld = {}
 local CT = DCSCore.ctld
 local U  = DCSCore.utils
 
--- pilotUnitName -> { side, template } — tracks what a helicopter is carrying
-CT._manifest = {}
--- true once ciribob ctld is configured or fallback is active
-CT._active   = false
+CT._active   = false   -- true once setup() completes
+CT._manifest = {}      -- pilotUnitName -> { side, loadType, loadCount }
 
 -- =============================================================
--- Primary Mode — ciribob's ctld.lua
+-- Per-aircraft load limits (override ciribob defaults as needed)
+-- =============================================================
+
+local UNIT_LOAD_LIMITS = {
+    ['Mi-8MT']       = 16,
+    ['Mi-24P']       = 4,
+    ['UH-1H']        = 10,
+    ['CH-47Fbl1']    = 33,
+    ['SH-60B']       = 6,
+    ['Ka-50']        = 0,
+    ['C-130']        = 80,
+    ['C-130J-30']    = 80,
+    ['IL-76MD']      = 90,
+    ['Hercules']     = 30,
+}
+
+-- =============================================================
+-- Primary Mode — ciribob ctld.lua
 -- =============================================================
 
 function CT._configureCiribob()
     if not ctld then return false end
 
-    local cfg = DCSCore.config.ctld
+    local cfg  = DCSCore.config.ctld
+    local lcfg = DCSCore.config.logistics or {}
 
-    ctld.enableCrates           = true
-    ctld.enableSmokeDrop        = true
-    ctld.enableRappelling       = false
-    ctld.enableFastRopeLoad     = false
-    ctld.maxTroopsCarried       = 10
-    ctld.maxCratesCarried       = 1
-    ctld.checkPickupDistance    = cfg.pickupRadius
-    ctld.maxAGL                 = cfg.maxAGL
-    ctld.maxSpeed               = cfg.maxSpeed
-    ctld.msgDuration            = cfg.msgDuration
+    -- ── Behaviour flags ─────────────────────────────────────
+    ctld.enableCrates              = true
+    ctld.enableSmokeDrop           = true
+    ctld.enableFastRopeInsertion   = true
+    ctld.enabledFOBBuilding        = true
+    ctld.enabledRadioBeaconDrop    = true
+    ctld.enableRepackingVehicles   = true
+    ctld.staticBugFix              = true
+    ctld.slingLoad                 = false   -- off: causes DCS physics crash
 
-    -- Combine both side transports into one list for ciribob
+    -- ── Loading parameters ───────────────────────────────────
+    ctld.numberOfTroops            = cfg.defaultTroopCount or 10
+    ctld.maximumDistanceLogistic   = cfg.pickupRadius      or 200
+    ctld.maxExtractDistance        = cfg.extractRadius     or 125
+    ctld.hoverTime                 = cfg.hoverLoadTime     or 10
+    ctld.minimumHoverHeight        = cfg.minHoverAGL       or 7.5
+    ctld.maximumHoverHeight        = cfg.maxHoverAGL       or 12.0
+    ctld.fastRopeMaximumHeight     = cfg.fastRopeMaxAGL    or 18.28
+
+    -- ── FOB ─────────────────────────────────────────────────
+    ctld.cratesRequiredForFOB      = cfg.fobCratesRequired or 3
+    ctld.buildTimeFOB              = cfg.fobBuildTime      or 120
+    ctld.troopPickupAtFOB          = true
+    ctld.forceCrateToBeMoved       = true   -- crates must be moved before unpacking
+
+    -- ── JTAC limits ─────────────────────────────────────────
+    ctld.JTAC_LIMIT_BLUE           = cfg.jtacLimitBlue     or 10
+    ctld.JTAC_LIMIT_RED            = cfg.jtacLimitRed      or 10
+    ctld.JTAC_smokeOn_BLUE         = true
+    ctld.JTAC_smokeOn_RED          = true
+    ctld.JTAC_allowStandbyMode     = true
+
+    -- ── AA limits ────────────────────────────────────────────
+    ctld.AASystemLimitBLUE         = cfg.aaLimitBlue       or 20
+    ctld.AASystemLimitRED          = cfg.aaLimitRed        or 20
+
+    -- ── Radio beacons ────────────────────────────────────────
+    ctld.deployedBeaconBattery     = lcfg.fobBeaconLife    or 30   -- minutes
+
+    -- ── Per-aircraft load limits ─────────────────────────────
+    for unitType, limit in pairs(UNIT_LOAD_LIMITS) do
+        ctld.unitLoadLimits = ctld.unitLoadLimits or {}
+        ctld.unitLoadLimits[unitType] = limit
+    end
+
+    -- ── Transport unit names ─────────────────────────────────
+    -- ciribob expects a flat list of unit names
     ctld.transportPilotNames = {}
     for _, name in ipairs(cfg.blueTransports) do
         table.insert(ctld.transportPilotNames, name)
@@ -55,55 +108,133 @@ function CT._configureCiribob()
         table.insert(ctld.transportPilotNames, name)
     end
 
-    -- Pickup zones
+    -- ── Pickup zones ─────────────────────────────────────────
+    -- Format: { zoneName, smokeColor, limit, "active"|"no", side, [flagNum] }
     ctld.pickupZones = {}
     for _, z in ipairs(cfg.bluePickupZones) do
         table.insert(ctld.pickupZones, {
-            zone   = z.name,
-            smoke  = z.smoke or trigger.smokeColor.Green,
-            side   = coalition.side.BLUE,
-            active = true,
+            z.name,
+            z.smoke  or "green",
+            z.limit  or -1,
+            z.active and "active" or "no",
+            2,           -- BLUE
+            z.flag,      -- optional flag number
         })
     end
     for _, z in ipairs(cfg.redPickupZones) do
         table.insert(ctld.pickupZones, {
-            zone   = z.name,
-            smoke  = z.smoke or trigger.smokeColor.Orange,
-            side   = coalition.side.RED,
-            active = true,
+            z.name,
+            z.smoke  or "orange",
+            z.limit  or -1,
+            z.active and "active" or "no",
+            1,           -- RED
+            z.flag,
         })
     end
 
-    -- Drop-off zones
-    ctld.dropOffZones = {}
+    -- ── Drop zones ───────────────────────────────────────────
+    -- Format: { zoneName, smokeColor, side }
+    ctld.dropZones = {}
     for _, z in ipairs(cfg.blueDropZones) do
-        table.insert(ctld.dropOffZones, {
-            zone   = z.name,
-            smoke  = z.smoke or trigger.smokeColor.Blue,
-            side   = coalition.side.BLUE,
-            active = true,
-        })
+        table.insert(ctld.dropZones, { z.name, z.smoke or "blue",   2 })
     end
     for _, z in ipairs(cfg.redDropZones) do
-        table.insert(ctld.dropOffZones, {
-            zone   = z.name,
-            smoke  = z.smoke or trigger.smokeColor.Red,
-            side   = coalition.side.RED,
-            active = true,
-        })
+        table.insert(ctld.dropZones, { z.name, z.smoke or "red",    1 })
     end
 
-    U.info('CTLD: ciribob ctld.lua configured')
+    -- ── Waypoint zones (patrol routes for dropped troops) ────
+    ctld.waypointZones = {}
+    for _, z in ipairs(cfg.blueWaypointZones or {}) do
+        table.insert(ctld.waypointZones,
+            { z.name, z.smoke or "white", z.active and "active" or "no", 2 })
+    end
+    for _, z in ipairs(cfg.redWaypointZones or {}) do
+        table.insert(ctld.waypointZones,
+            { z.name, z.smoke or "white", z.active and "active" or "no", 1 })
+    end
+
+    U.info('CTLD: ciribob configured — ' ..
+           #ctld.pickupZones .. ' pickup zones, ' ..
+           #ctld.dropZones .. ' drop zones')
     return true
 end
 
 -- =============================================================
--- Fallback Mode — MIST-based troop spawn
+-- Callback registration (ciribob's event system)
+-- ctld.addCallback(fn) where fn receives an args table:
+--   args.eventType  "unitLoaded" | "unitDropped" | "cratePickup"
+--                   | "crateDropped" | "jtacStatus"
+--   args.unit       the transport helicopter unit
+--   args.side       coalition.side.*
+--   (additional fields vary by event type)
 -- =============================================================
 
---- Spawn a copy of a late-activated ME template near `pilotUnit`.
--- The clone spawns on the side of the helicopter facing away from
--- the objective (pilot-side), offset by ~30 m.
+function CT._registerCallbacks()
+    if not ctld or not ctld.addCallback then
+        U.debug('CTLD: ctld.addCallback not available')
+        return
+    end
+
+    ctld.addCallback(function(args)
+        if not args or not args.eventType then return end
+
+        local evType = args.eventType
+        local unit   = args.unit
+        local side   = args.side
+
+        -- ── Troops loaded ────────────────────────────────────
+        if evType == 'unitLoaded' then
+            if unit and unit:isExist() then
+                local name = unit:getName()
+                CT._manifest[name] = { side = side, loadType = 'troops' }
+                U.debug('CTLD: troops loaded onto ' .. name)
+            end
+
+        -- ── Troops dropped ───────────────────────────────────
+        elseif evType == 'unitDropped' then
+            if unit and unit:isExist() then
+                local name = unit:getName()
+                CT._manifest[name] = nil
+
+                -- Insertion suppression cross-hook
+                CT.onTroopDropHook(unit, side)
+
+                U.info('CTLD: troops dropped from ' .. name)
+            end
+
+        -- ── Crate picked up ──────────────────────────────────
+        elseif evType == 'cratePickup' then
+            if unit and unit:isExist() then
+                CT._manifest[unit:getName()] = {
+                    side = side, loadType = 'crate',
+                    crateWeight = args.crateWeight,
+                }
+                U.debug('CTLD: crate picked up by ' .. unit:getName())
+            end
+
+        -- ── Crate dropped ────────────────────────────────────
+        elseif evType == 'crateDropped' then
+            -- Notify logistics module so it can watch for SAM/JTAC assembly
+            if DCSCore.logistics and DCSCore.logistics.onCrateDropped then
+                DCSCore.logistics.onCrateDropped(args)
+            end
+            if unit and unit:isExist() then
+                CT._manifest[unit:getName()] = nil
+            end
+            U.debug('CTLD: crate dropped')
+        end
+    end)
+
+    U.info('CTLD: callbacks registered via ctld.addCallback')
+end
+
+-- =============================================================
+-- Fallback Mode — MIST-based troop spawn
+-- Used automatically when ctld.lua is not loaded.
+-- Spawns a copy of a late-activated ME group template near
+-- the grounded helicopter.
+-- =============================================================
+
 local function spawnTemplate(templateName, pilotUnit, side)
     if not mist then
         U.error('CTLD fallback: MIST not loaded')
@@ -112,98 +243,87 @@ local function spawnTemplate(templateName, pilotUnit, side)
 
     local pos     = pilotUnit:getPosition().p
     local heading = mist.getHeading(pilotUnit)
+    local dist    = 30
+    local spawnX  = pos.x + dist * math.cos(heading + math.pi / 2)
+    local spawnZ  = pos.z + dist * math.sin(heading + math.pi / 2)
 
-    -- Offset to the left of the helicopter
-    local offsetDist = 30
-    local spawnX = pos.x + offsetDist * math.cos(heading + math.pi / 2)
-    local spawnZ = pos.z + offsetDist * math.sin(heading + math.pi / 2)
-
-    local templateData = mist.getGroupData(templateName)
-    if not templateData then
+    local tplData = mist.getGroupData(templateName)
+    if not tplData then
         U.error('CTLD fallback: template not found — ' .. templateName)
         return false
     end
 
-    -- Deep-copy and relocate
-    local cloneData       = mist.utils.deepCopy(templateData)
-    cloneData.groupId     = mist.getNextGroupId()
-    cloneData.name        = templateName .. '_drop_' .. math.random(1000, 9999)
-    cloneData.hidden      = false
-    cloneData.start_time  = 0
-    cloneData.x           = spawnX
-    cloneData.y           = spawnZ
+    local clone          = mist.utils.deepCopy(tplData)
+    clone.groupId        = mist.getNextGroupId()
+    clone.name           = templateName .. '_drop_' .. math.random(1000, 9999)
+    clone.hidden         = false
+    clone.start_time     = 0
+    clone.x              = spawnX
+    clone.y              = spawnZ
 
-    for _, unitData in ipairs(cloneData.units) do
-        local dx        = unitData.x - templateData.x
-        local dz        = unitData.y - templateData.y
-        unitData.x      = spawnX + dx
-        unitData.y      = spawnZ + dz
-        unitData.unitId = mist.getNextUnitId()
+    for _, ud in ipairs(clone.units) do
+        local dx = ud.x - tplData.x
+        local dz = ud.y - tplData.y
+        ud.x      = spawnX + dx
+        ud.y      = spawnZ + dz
+        ud.unitId = mist.getNextUnitId()
     end
 
-    mist.dynAdd(cloneData)
+    mist.dynAdd(clone)
     return true
 end
 
---- Attempt a troop-drop from the given pilot unit using the fallback system.
 function CT.fallbackDrop(pilotUnitName, templateName, side)
     local cfg  = DCSCore.config.ctld
     local unit = U.getUnit(pilotUnitName)
 
     if not unit then
-        U.msgCoalition(side, '[CTLD] Pilot unit not found: ' .. pilotUnitName, 10)
+        U.msgCoalition(side, '[CTLD] Unit not found: ' .. pilotUnitName, 8)
+        return false
+    end
+    if not U.isUnitGrounded(unit, cfg.maxAGL or 15, cfg.maxSpeed or 2) then
+        U.msgCoalition(side, '[CTLD] Must be on the ground to deploy troops.', 8)
         return false
     end
 
-    if not U.isUnitGrounded(unit, cfg.maxAGL, cfg.maxSpeed) then
-        U.msgCoalition(side,
-            '[CTLD] Must be on the ground and stationary to deploy troops.', 8)
-        return false
-    end
-
-    local pos = unit:getPosition().p
-
-    -- Check proximity to a pickup zone
-    local pickupZones = side == coalition.side.BLUE
-        and cfg.bluePickupZones or cfg.redPickupZones
-    local inZone = false
-    for _, z in ipairs(pickupZones) do
-        local zVec = U.getZoneVec3(z.name)
-        if zVec and U.dist2D(pos, zVec) <= cfg.pickupRadius then
-            inZone = true
-            break
+    local pos       = unit:getPosition().p
+    local zones     = side == coalition.side.BLUE
+                      and cfg.bluePickupZones or cfg.redPickupZones
+    local inZone    = false
+    for _, z in ipairs(zones) do
+        local zv = U.getZoneVec3(z.name)
+        if zv and U.dist2D(pos, zv) <= (cfg.pickupRadius or 200) then
+            inZone = true; break
         end
     end
     if not inZone then
-        U.msgCoalition(side,
-            '[CTLD] Not within a pickup zone (' .. cfg.pickupRadius .. 'm).', 8)
+        U.msgCoalition(side, '[CTLD] Not within a pickup zone.', 8)
         return false
     end
 
     if not spawnTemplate(templateName, unit, side) then return false end
 
     CT._manifest[pilotUnitName] = nil
+    CT.onTroopDropHook(unit, side)
     local mgrs = mist and mist.tostringMGRS(pos, 5) or '?'
     U.msgCoalition(side,
-        '[CTLD] Troops deployed at ' .. mgrs, cfg.msgDuration)
-    U.info('CTLD: fallback drop by ' .. pilotUnitName ..
-           ' template=' .. templateName)
+        '[CTLD] Troops deployed at ' .. mgrs, cfg.msgDuration or 15)
+    U.info('CTLD: fallback drop — ' .. pilotUnitName .. ' template=' .. templateName)
     return true
 end
 
 -- =============================================================
--- Suppression on insertion (cross-system hook)
--- Called by server_core after CTLD confirms a drop.
--- Suppresses enemies within 500 m of the drop point for 20 s.
+-- Cross-system hook — insertion suppression
+-- Called by both the ciribob callback and the fallback path.
 -- =============================================================
 
 function CT.onTroopDropHook(pilotUnit, side)
     if not DCSCore.suppression then return end
 
-    local pos      = pilotUnit:getPosition().p
+    local pos       = pilotUnit:getPosition().p
     local enemySide = side == coalition.side.BLUE
-        and coalition.side.RED or coalition.side.BLUE
-    local enemies  = U.getUnitsInRadius(pos, 500, enemySide)
+                      and coalition.side.RED or coalition.side.BLUE
+    local enemies   = U.getUnitsInRadius(pos, 500, enemySide)
 
     for _, enemy in ipairs(enemies) do
         if enemy:isExist() then
@@ -218,79 +338,6 @@ function CT.onTroopDropHook(pilotUnit, side)
 end
 
 -- =============================================================
--- F10 Menu
--- =============================================================
-
-local function buildF10Menus()
-    local cfg = DCSCore.config.ctld
-    if not mist then return end   -- menus use MGRS coords
-
-    local function listZones(side)
-        local zones = side == coalition.side.BLUE
-            and cfg.bluePickupZones or cfg.redPickupZones
-        if #zones == 0 then
-            U.msgCoalition(side, '[CTLD] No pickup zones configured.', 10)
-            return
-        end
-        local msg = '[CTLD] Pickup zones:\n'
-        for i, z in ipairs(zones) do
-            local vec  = U.getZoneVec3(z.name)
-            local coord = vec and mist.tostringMGRS(vec, 5) or 'unknown'
-            msg = msg .. i .. '. ' .. z.name .. '  ' .. coord .. '\n'
-        end
-        U.msgCoalition(side, msg, 20)
-    end
-
-    local function dropStatus(side)
-        local count = 0
-        for _, data in pairs(CT._manifest) do
-            if data.side == side then count = count + 1 end
-        end
-        U.msgCoalition(side,
-            '[CTLD] Helicopters with troops aboard: ' .. count, 10)
-    end
-
-    -- BLUE menu
-    if #cfg.blueTransports > 0 or #cfg.bluePickupZones > 0 then
-        local m = missionCommands.addSubMenuForCoalition(
-            coalition.side.BLUE, 'CTLD', nil)
-        missionCommands.addCommandForCoalition(
-            coalition.side.BLUE, 'List Pickup Zones', m, listZones, coalition.side.BLUE)
-        missionCommands.addCommandForCoalition(
-            coalition.side.BLUE, 'Troop Lift Status', m, dropStatus, coalition.side.BLUE)
-    end
-
-    -- RED menu
-    if #cfg.redTransports > 0 or #cfg.redPickupZones > 0 then
-        local m = missionCommands.addSubMenuForCoalition(
-            coalition.side.RED, 'CTLD', nil)
-        missionCommands.addCommandForCoalition(
-            coalition.side.RED, 'List Pickup Zones', m, listZones, coalition.side.RED)
-        missionCommands.addCommandForCoalition(
-            coalition.side.RED, 'Troop Lift Status', m, dropStatus, coalition.side.RED)
-    end
-end
-
--- =============================================================
--- ciribob onTroopDrop hook (wired if available)
--- =============================================================
-
-local function hookCiribobCallbacks()
-    if not ctld then return end
-
-    -- ciribob exposes ctld.onTroopDrop = function(unit, zone, side)
-    -- Wrap it to fire our cross-system suppression hook.
-    local original = ctld.onTroopDrop
-    if original then
-        ctld.onTroopDrop = function(unit, zone, side)
-            original(unit, zone, side)
-            CT.onTroopDropHook(unit, side)
-        end
-        U.info('CTLD: ciribob onTroopDrop hook installed')
-    end
-end
-
--- =============================================================
 -- Public API
 -- =============================================================
 
@@ -301,16 +348,15 @@ function CT.setup()
         return
     end
 
-    local usedCiribob = CT._configureCiribob()
-    if not usedCiribob then
-        U.info('CTLD: ctld.lua not present — fallback MIST mode active')
+    local primary = CT._configureCiribob()
+    if primary then
+        CT._registerCallbacks()
+    else
+        U.info('CTLD: ctld.lua not present — MIST fallback active')
     end
 
-    hookCiribobCallbacks()
-    buildF10Menus()
-
     CT._active = true
-    U.info('CTLD: setup complete (ciribob=' .. tostring(usedCiribob) .. ')')
+    U.info('CTLD: setup complete (primary=' .. tostring(primary) .. ')')
 end
 
 U.info('ctld_config.lua loaded')

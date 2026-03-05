@@ -6,15 +6,16 @@
 -- LOAD ORDER (Mission Editor triggers — Time More):
 --   1 s  → DO SCRIPT FILE  mist.lua
 --   2 s  → DO SCRIPT FILE  iads_v1_r37.lua         (optional)
---   3 s  → DO SCRIPT FILE  ctld.lua                (optional)
+--   3 s  → DO SCRIPT FILE  ctld.lua                (optional — ciribob CTLD)
 --   4 s  → DO SCRIPT FILE  ArtilleryEnhancement.lua (optional)
 --   5 s  → DO SCRIPT FILE  scripts/utils.lua
 --   6 s  → DO SCRIPT FILE  scripts/config.lua
 --   7 s  → DO SCRIPT FILE  scripts/iads_manager.lua
 --   8 s  → DO SCRIPT FILE  scripts/suppression.lua
 --   9 s  → DO SCRIPT FILE  scripts/ctld_config.lua
---  10 s  → DO SCRIPT FILE  scripts/artillery_manager.lua
---  11 s  → DO SCRIPT FILE  scripts/server_core.lua   ← THIS FILE
+--  10 s  → DO SCRIPT FILE  scripts/ctld_logistics.lua
+--  11 s  → DO SCRIPT FILE  scripts/artillery_manager.lua
+--  12 s  → DO SCRIPT FILE  scripts/server_core.lua   ← THIS FILE
 -- =============================================================
 
 DCSCore = DCSCore or {}
@@ -26,9 +27,9 @@ DCSCore = DCSCore or {}
 local function printBanner()
     local lines = {
         '==============================================',
-        '  DCS Server Core  v1.0',
-        '  Systems: IADS | SmartSAM | Suppression',
-        '           CTLD | Counter-Battery Arty',
+        '  DCS Server Core  v1.1',
+        '  IADS | SmartSAM | Suppression | CTLD',
+        '  Logistics | Counter-Battery Arty',
         '==============================================',
     }
     for _, l in ipairs(lines) do
@@ -45,6 +46,7 @@ local DEPS = {
     { label = 'IADScript',            global = 'iads',                 required = false },
     { label = 'ciribob CTLD',         global = 'ctld',                 required = false },
     { label = 'ArtilleryEnhancement', global = 'ArtilleryEnhancement', required = false },
+    { label = 'DCSCore.logistics',    global = nil,                    required = false },
 }
 
 local function reportDependencies()
@@ -94,6 +96,34 @@ local function wireArtilleryCTLD()
     -- Nothing extra to patch; artillery_manager calls _warnCTLDZones
     -- internally for every confirmed CB impact.
     DCSCore.utils.info('CORE: Artillery <-> CTLD zone-warning link confirmed')
+end
+
+--- Artillery fireMission() deducts from the logistics ammo pool.
+--- Batteries that are Winchester are blocked until a supply truck arrives.
+local function wireLogisticsAmmo()
+    if not DCSCore.logistics or not DCSCore.artillery then return end
+
+    local origFire = DCSCore.artillery.fireMission
+    DCSCore.artillery.fireMission = function(batteryName, targetPos, rounds, msgSide)
+        if not DCSCore.logistics.hasAmmo(batteryName) then
+            local bat  = DCSCore.artillery._batteries[batteryName]
+            local side = bat and bat.side or msgSide
+            if side then
+                DCSCore.utils.msgCoalition(side,
+                    '[LOGISTICS] ' .. batteryName ..
+                    ' is WINCHESTER — awaiting resupply.', 15)
+            end
+            return false
+        end
+
+        local ok = origFire(batteryName, targetPos, rounds, msgSide)
+        if ok then
+            DCSCore.logistics.consumeAmmo(batteryName, rounds or 20)
+        end
+        return ok
+    end
+
+    DCSCore.utils.info('CORE: Artillery <-> Logistics ammo hook wired')
 end
 
 --- After a CTLD troop drop the helicopter's approach suppresses nearby enemies.
@@ -211,7 +241,44 @@ local function buildAdminMenu()
             'Lift Manifest', m, function()
                 local n = DCSCore.utils.tableLength(DCSCore.ctld._manifest)
                 DCSCore.utils.msgCoalition(coalition.side.BLUE,
-                    '[CTLD] Helicopters with troops: ' .. n, 10)
+                    '[CTLD] Helicopters with cargo: ' .. n, 10)
+            end)
+    end
+
+    -- ── Logistics ─────────────────────────────────────────────
+    if DCSCore.logistics then
+        local m = missionCommands.addSubMenuForCoalition(
+            coalition.side.BLUE, 'Logistics', root)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'Ammo Summary', m, function()
+                local lines  = { '[LOGISTICS] Ammo:' }
+                local total  = 0
+                local low    = 0
+                local winch  = 0
+                for name, bat in pairs(DCSCore.logistics._batteries) do
+                    if bat.side == coalition.side.BLUE then
+                        total = total + 1
+                        if bat.rounds == 0 then winch = winch + 1
+                        elseif bat.rounds < bat.maxRounds * 0.25 then low = low + 1 end
+                        table.insert(lines, string.format(
+                            '  %s  %d/%d', name, bat.rounds, bat.maxRounds))
+                    end
+                end
+                table.insert(lines, string.format(
+                    'Batteries: %d  Low: %d  Winchester: %d', total, low, winch))
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    table.concat(lines, '\n'), 25)
+            end)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'FOB / Convoy Status', m, function()
+                local fobs    = DCSCore.utils.tableLength(DCSCore.logistics._fobs)
+                local convoys = DCSCore.utils.tableLength(DCSCore.logistics._convoys)
+                local jtacs   = DCSCore.utils.tableLength(DCSCore.logistics._jtacs)
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    string.format('[LOGISTICS] FOBs: %d  Convoys: %d  JTACs: %d',
+                        fobs, convoys, jtacs), 12)
             end)
     end
 
@@ -247,6 +314,18 @@ local function startStatusBroadcast()
                 if s.displacing then disp = disp + 1 end
             end
             table.insert(parts, 'ARTY disp=' .. disp)
+        end
+
+        if DCSCore.logistics then
+            local winch = 0
+            for _, b in pairs(DCSCore.logistics._batteries) do
+                if b.rounds == 0 then winch = winch + 1 end
+            end
+            local fobs    = DCSCore.utils.tableLength(DCSCore.logistics._fobs)
+            local convoys = DCSCore.utils.tableLength(DCSCore.logistics._convoys)
+            table.insert(parts,
+                'LOG fobs=' .. fobs .. ' convoys=' .. convoys ..
+                ' winchester=' .. winch)
         end
 
         env.info(table.concat(parts, '  '))
@@ -298,10 +377,17 @@ local function init()
         DCSCore.artillery.setup()
     end
 
+    -- Logistics must come after artillery (reads battery list) and
+    -- after CTLD (listens to its callbacks).
+    if DCSCore.logistics then
+        DCSCore.logistics.setup()
+    end
+
     -- ── Cross-system hooks ────────────────────────────────────
     wireIADSSuppression()
     wireArtilleryCTLD()
     wireCTLDSuppression()
+    wireLogisticsAmmo()
 
     -- ── Admin UI & status ─────────────────────────────────────
     buildAdminMenu()

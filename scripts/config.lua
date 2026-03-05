@@ -83,39 +83,79 @@ cfg.suppression = {
 }
 
 -- =============================================================
--- CTLD — Combined Arms Troop Load / Drop
+-- CTLD — Complete Troops and Logistics Deployment
 -- Requires ciribob's ctld.lua (https://github.com/ciribob/DCS-CTLD)
--- OR operates in lightweight fallback mode using MIST if ctld.lua
--- is not present.
+-- Falls back to lightweight MIST mode if ctld.lua is absent.
+--
+-- Zone table fields used by ctld_config.lua:
+--   name    string   ME trigger zone name
+--   smoke   string   "green"|"red"|"blue"|"orange"|"white"|"none"
+--   limit   number   -1=unlimited, 0-20=group cap  (pickup zones only)
+--   active  bool     true=starts enabled  (pickup zones only)
+--   flag    number   optional ME flag to track remaining groups
 -- =============================================================
 cfg.ctld = {
     enabled = true,
 
-    -- Unit names of player-controlled transport helicopters.
+    -- ── Transport helicopter unit names ──────────────────────
     blueTransports = {
         -- 'UH-1H Blue 1',
-        -- 'UH-60 Blue 1',
+        -- 'CH-47 Blue 1',
     },
     redTransports = {
         -- 'Mi-8 Red 1',
     },
 
-    -- Trigger zone names (created in Mission Editor).
+    -- ── Pickup zones (troops and crates available here) ──────
     bluePickupZones = {
-        -- { name = 'CTLD_Blue_Pickup_1', smoke = trigger.smokeColor.Green  },
-        -- { name = 'CTLD_Blue_Pickup_2', smoke = trigger.smokeColor.Green  },
+        -- { name='CTLD_Blue_Pickup_1', smoke='green',  limit=-1, active=true  },
+        -- { name='CTLD_Blue_Pickup_2', smoke='green',  limit=5,  active=true  },
     },
     redPickupZones = {
-        -- { name = 'CTLD_Red_Pickup_1',  smoke = trigger.smokeColor.Orange },
-    },
-    blueDropZones = {
-        -- { name = 'CTLD_Blue_Drop_1',   smoke = trigger.smokeColor.Blue   },
-    },
-    redDropZones = {
-        -- { name = 'CTLD_Red_Drop_1',    smoke = trigger.smokeColor.Red    },
+        -- { name='CTLD_Red_Pickup_1',  smoke='orange', limit=-1, active=true  },
     },
 
-    -- Late-activated group templates in the ME used by fallback mode.
+    -- ── Drop / offload zones ─────────────────────────────────
+    blueDropZones = {
+        -- { name='CTLD_Blue_Drop_1', smoke='blue' },
+    },
+    redDropZones = {
+        -- { name='CTLD_Red_Drop_1',  smoke='red'  },
+    },
+
+    -- ── Waypoint zones (dropped troops patrol toward these) ──
+    blueWaypointZones = {
+        -- { name='CTLD_Blue_WP_1', smoke='white', active=true },
+    },
+    redWaypointZones = {
+        -- { name='CTLD_Red_WP_1',  smoke='white', active=true },
+    },
+
+    -- ── Behaviour parameters ─────────────────────────────────
+    defaultTroopCount  = 10,    -- soldiers per load (default)
+    pickupRadius       = 200,   -- metres — max distance from zone centre
+    extractRadius      = 125,   -- metres — max extract distance
+    maxAGL             = 15,    -- metres AGL for grounded check
+    maxSpeed           = 2,     -- m/s for grounded check
+    minHoverAGL        = 7.5,   -- metres — minimum hover height for crate load
+    maxHoverAGL        = 12.0,  -- metres — maximum hover height for crate load
+    hoverLoadTime      = 10,    -- seconds to hover before crate attaches
+    fastRopeMaxAGL     = 18.28, -- metres — 60 ft fast-rope safety limit
+    msgDuration        = 15,    -- seconds player messages are displayed
+
+    -- ── FOB ──────────────────────────────────────────────────
+    fobCratesRequired  = 3,     -- crates to build a FOB
+    fobBuildTime       = 120,   -- seconds to assemble after last crate placed
+
+    -- ── JTAC limits ──────────────────────────────────────────
+    jtacLimitBlue      = 10,
+    jtacLimitRed       = 10,
+
+    -- ── AA/SAM system limits ─────────────────────────────────
+    aaLimitBlue        = 20,
+    aaLimitRed         = 20,
+
+    -- ── Late-activated ME templates (fallback MIST mode only) ─
     troopTemplates = {
         blue = {
             infantry = 'CTLD_Blue_Infantry_Template',
@@ -128,11 +168,49 @@ cfg.ctld = {
             atgm     = 'CTLD_Red_ATGM_Template',
         },
     },
+}
 
-    pickupRadius = 200,  -- metres — helicopter must be within this of zone centre
-    maxAGL       = 15,   -- metres AGL for grounded check
-    maxSpeed     = 2,    -- m/s for grounded check
-    msgDuration  = 15,   -- seconds player messages are displayed
+-- =============================================================
+-- Logistics — supply chain, convoys, FOB management
+-- =============================================================
+cfg.logistics = {
+    enabled = true,
+    f10MenuEnabled = true,
+
+    -- ── Battery ammo pool ────────────────────────────────────
+    batteryStartingRounds = 100,   -- rounds per battery at mission start
+    ammoResupplyAmount    = 100,   -- rounds restored per truck resupply
+    supplyCheckInterval   = 60,    -- seconds between truck-proximity polls
+    supplyRadiusBattery   = 300,   -- metres — truck must be within to resupply
+    supplyRadiusFOB       = 500,   -- metres — FOB supply radius for convoys
+
+    -- ── Supply convoys ───────────────────────────────────────
+    -- HQ zones: ME trigger zones where convoys spawn.
+    -- Must match zone names created in Mission Editor.
+    blueHQZones = {
+        -- 'Blue_HQ_Zone_1',
+    },
+    redHQZones = {
+        -- 'Red_HQ_Zone_1',
+    },
+
+    -- Late-activated convoy group templates in the ME.
+    blueConvoyTemplate = 'Blue_Supply_Convoy',
+    redConvoyTemplate  = 'Red_Supply_Convoy',
+
+    -- ── JTAC auto-registration ────────────────────────────────
+    jtacAutoRegister = true,   -- register CTLD-deployed JTACs as arty spotters
+    jtacScanDelay    = 30,     -- seconds after crate drop to scan for unit
+
+    -- ── SAM auto-IADS registration ────────────────────────────
+    samAutoRegister  = true,   -- add assembled CTLD SAM systems to IADS
+    samBuildDelay    = 45,     -- seconds after crate assembly to scan area
+
+    -- ── Radio beacons ─────────────────────────────────────────
+    fobBeaconLife    = 30,     -- minutes, FOB beacon battery life
+
+    -- ── Downed-pilot extraction ────────────────────────────────
+    extractionEnabled = true,
 }
 
 -- =============================================================
