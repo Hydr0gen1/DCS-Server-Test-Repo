@@ -600,6 +600,478 @@ AI.Option.Ground.val.ALARM_STATE.RED    -- 2 (fully alert, radar on)
 
 ---
 
+---
+
+## This Repository — DCS Server Core
+
+### Architecture
+
+All modules hang off a single global namespace table:
+
+```lua
+DCSCore = {
+    utils      = {},   -- shared helpers (utils.lua)
+    config     = {},   -- mission config  (config.lua)
+    iads       = {},   -- IADS + SEAD evasion (iads_manager.lua)
+    suppression= {},   -- suppression fire (suppression.lua)
+    ctld       = {},   -- CTLD wrapper (ctld_config.lua)
+    logistics  = {},   -- supply chain, SAM ammo, convoys (ctld_logistics.lua)
+    credits    = {},   -- resource economy (credits.lua)
+    artillery  = {},   -- counter-battery (artillery_manager.lua)
+}
+```
+
+`server_core.lua` is the entry point. It calls `*.setup()` on every module in the
+correct order, then wires cross-system hooks via function wrapping.
+
+### Load Order
+
+```
+ 1s  mist.lua                        (required)
+ 2s  iads_v1_r37.lua                 (optional)
+ 3s  ctld.lua                        (optional — ciribob CTLD)
+ 4s  ArtilleryEnhancement.lua        (optional)
+ 5s  scripts/utils.lua
+ 6s  scripts/config.lua
+ 7s  scripts/iads_manager.lua
+ 8s  scripts/suppression.lua
+ 9s  scripts/ctld_config.lua
+10s  scripts/ctld_logistics.lua
+11s  scripts/artillery_manager.lua
+12s  scripts/credits.lua
+13s  scripts/server_core.lua
+```
+
+---
+
+### scripts/utils.lua
+
+Shared helpers used by every other module.  All other modules alias `DCSCore.utils`
+to a local `U`.
+
+```lua
+U.getUnit(name)                           -- nil-safe Unit.getByName + isExist check
+U.getGroup(name)                          -- nil-safe Group.getByName + isExist check
+U.dist2D(v1, v2)                          -- XZ distance between two Vec3s
+U.dist3D(v1, v2)                          -- full 3D distance
+U.getZoneVec3(zoneName)                   -- trigger zone centre as Vec3
+U.isUnitGrounded(unit, maxAGL, maxSpeed)  -- helicopter grounded check
+U.getUnitsInRadius(point, radius, side)   -- world.searchObjects sphere, optional side filter
+U.msgCoalition(side, text, duration)
+U.schedule(func, delay, args)             -- wraps timer.scheduleFunction
+U.tableContains(t, val)
+U.tableLength(t)                          -- counts keys (works on non-sequential tables)
+U.info / U.debug / U.error(msg)           -- respects cfg.admin.logLevel (0=off 1=err 2=info 3=debug)
+```
+
+---
+
+### scripts/config.lua
+
+Single file for all mission-specific settings.  Operators edit this file only.
+
+| Section | Purpose |
+|---|---|
+| `cfg.admin` | Log level, F10 menu toggles, status broadcast interval |
+| `cfg.iads` | IADS level, SAM group name prefixes, SEAD missile list |
+| `cfg.smarterSAM` | SEAD scatter radius/formation, radar-off delay range |
+| `cfg.suppression` | Hold time, max hold, extension per hit |
+| `cfg.ctld` | Transports, zones, FOB/JTAC limits, hover params |
+| `cfg.logistics` | Battery rounds, convoy templates, HQ zones, SAM ammo, credit costs, auto-resupply thresholds |
+| `cfg.credits` | Starting balances, enabled flag |
+| `cfg.artillery` | Battery/spotter/radar group names, CB suppression settings |
+
+Key `cfg.logistics` fields added for v2:
+
+```lua
+cfg.logistics = {
+    -- SAM ammo
+    samAmmoEnabled            = true,
+    samReloadDelay            = 60,     -- seconds before radar re-activates after resupply
+
+    -- Credit costs
+    manualConvoyCost          = 30,
+    autoConvoyCost            = 50,
+    samResupplyCost           = 75,
+
+    -- Auto-resupply
+    autoResupplyEnabled       = true,
+    autoResupplyThreshold     = 0.25,   -- battery rounds/max below which auto triggers
+    samAutoResupplyThreshold  = 0.25,   -- SAM missiles/max below which auto triggers
+    maxAutoConvoysPerSide     = 2,
+    autoResupplyCheckInterval = 120,    -- seconds between polls
+}
+```
+
+---
+
+### scripts/iads_manager.lua — `DCSCore.iads`
+
+Wraps IADScript (`iads`) and adds Smarter SAM SEAD evasion.
+
+```lua
+IM.setup()                        -- reads cfg.iads, calls iads.addAllByPrefix for each prefix
+IM.goDark(groupName, duration)    -- force radar off for N seconds
+IM.extendDark(groupName, extra)   -- extend existing dark window
+IM.isEvading(groupName)           -- returns true while radar is forced off
+
+-- Internal state
+IM._evading  = {}   -- groupName -> { until, timer }
+IM._initialized = false
+
+-- Event handler (S_EVENT_SHOT): detects SEAD missiles from cfg.smarterSAM.seadMissiles,
+-- calls mist.groupRandomDistSelf on target group, sets ALARM_STATE GREEN,
+-- schedules ALARM_STATE RED after random delay in [radarOffMinDelay, radarOffMaxDelay]
+```
+
+**Cross-hook (server_core):** If a hit arrives via `suppression._suppress` on a group
+that `iads.isEvading()` returns true for, the dark window is extended by 15s.
+
+---
+
+### scripts/suppression.lua — `DCSCore.suppression`
+
+`S_EVENT_HIT` → sets ROE `WEAPON_HOLD` with diminishing-returns extension.
+
+```lua
+SUP.setup()
+SUP.suppressGroup(groupName, duration)  -- manual suppress (used by ctld_config troop drop hook)
+SUP.isSuppressed(groupName)             -- queried by credits.lua for suppression-assist bonus
+SUP.clearSuppression(groupName)
+
+-- Internal state
+SUP._state = {}  -- groupName -> { expiry, hitCount }
+```
+
+Config: `baseHoldTime` (15s default), `maxHoldTime` (80s), `holdExtension` (10s/hit).
+
+---
+
+### scripts/ctld_config.lua — `DCSCore.ctld`
+
+Configures ciribob's CTLD with the real ciribob API and provides a MIST fallback.
+
+**ciribob zone format** (positional, NOT key-value):
+```lua
+-- Pickup: { zoneName, smokeColor, limit, "active"|"no", side, [flagNum] }
+-- Drop:   { zoneName, smokeColor, side }
+-- Waypoint: { zoneName, smokeColor, "active"|"no", side }
+-- side: 1=RED  2=BLUE  0=both
+```
+
+**Callbacks** registered via `ctld.addCallback(fn)`.  `args.eventType` values:
+- `"unitLoaded"` / `"unitDropped"` / `"cratePickup"` / `"crateDropped"`
+
+```lua
+CT._active   = false   -- set true after setup()
+CT._manifest = {}      -- pilotUnitName -> { side, loadType, loadCount }
+
+CT.setup()
+CT.fallbackDrop(pilotUnitName, templateName, side)  -- MIST-based fallback
+CT.onTroopDropHook(pilotUnit, side)                 -- suppresses enemies within 500m of LZ
+```
+
+**Cross-hook:** `onTroopDropHook` is called by both the ciribob callback and
+the fallback path; it calls `DCSCore.suppression.suppressGroup` on nearby enemies.
+
+---
+
+### scripts/ctld_logistics.lua — `DCSCore.logistics`
+
+v2 — Supply chain, SAM missile tracking, smart auto-resupply.
+
+#### State tables
+
+```lua
+LOG._batteries          = {}  -- groupName -> { side, rounds, maxRounds, lastResupply, status }
+LOG._samAmmo            = {}  -- groupName -> { side, missiles, maxMissiles, lastFired, status, lowWarned }
+LOG._fobs               = {}  -- id        -> { pos, side, builtAt, name }
+LOG._convoys            = {}  -- groupName -> { side, spawnTime, destination, destType, destPos, auto }
+LOG._jtacs              = {}  -- unitName  -> { side, pos, registeredAt }
+LOG._autoResupplyPending = {} -- targetName -> true (block duplicate dispatch)
+```
+
+#### Artillery battery API
+
+```lua
+LOG.registerBattery(groupName, side)       -- called by artillery_manager.setup()
+LOG.consumeAmmo(groupName, rounds)         -- deducted by server_core wire on fireMission
+LOG.hasAmmo(groupName)                     -- returns true if rounds > 0
+LOG.resupply(groupName, amount)            -- restore rounds; amount defaults to cfg.ammoResupplyAmount
+```
+
+#### SAM ammo tracking
+
+```lua
+LOG.initSAMAmmo(groupName, side)    -- scans group units against SAM_LAUNCHER_MISSILES table
+LOG.resupplySAM(groupName, amount)  -- restore missiles; schedules radar restore after samReloadDelay
+
+-- States: 'OK'  'LOW' (<50%)  'CRITICAL' (<25%)  'WINCHESTER' (0)
+```
+
+`SAM_LAUNCHER_MISSILES` — per-unit-type missile capacity:
+
+| System | Unit type name | Missiles |
+|---|---|---|
+| SA-6 Kub | `Kub 2P25 ln` | 3 |
+| SA-11 BUK | `Buk 9A310M1` | 4 |
+| S-300 PS | `S-300PS 5P85C ln` | 4 |
+| HAWK | `Hawk ln` | 3 |
+| Patriot | `Patriot ln` | 4 |
+| SA-15 Tor | `Tor 9A331` | 8 |
+| SA-8 Osa | `Osa 9A33 ln` | 4 |
+| SA-19 Tunguska | `2S6 Tunguska` | 8 |
+| Avenger | `M1097 Avenger` | 8 |
+| NASAMS | `NASAMS_LN_B/C` | 6 |
+| Gepard/Shilka | — | 0 (cannon, not tracked) |
+
+**Winchester SAM behavior:**
+1. `ALARM_STATE GREEN` set immediately (radar off)
+2. `iads.goDark(groupName, 86400)` (24hr IADS dark)
+3. On resupply: missiles restored, `IM._evading[groupName] = nil` cleared
+4. After `samReloadDelay` seconds: `ALARM_STATE RED` restored
+
+**SAM shot handler:** `LOG._samShotHandler` listens for `S_EVENT_SHOT` with
+`weapon:getCategory() == Weapon.Category.MISSILE` (3).  Shooter unit's group is
+looked up in `LOG._samAmmo`.
+
+#### Supply truck proximity resupply
+
+`checkSupplyTrucks()` runs every `supplyCheckInterval` seconds.
+Supply vehicle types: `'M-818'`, `'KAMAZ Truck'`, `'Ural-375'`, `'Ural-4320'`, `'Tigr'`.
+Any such unit within `supplyRadiusBattery` metres of a tracked battery or SAM
+triggers a resupply.  SAMs require a 120s cooldown since last shot.
+
+#### Convoy system
+
+Two convoy paths exist:
+
+**Zone convoy** (manual F10 dispatch):
+```lua
+LOG.spawnConvoy(side, fromZoneName, toZoneName)
+-- Clones blueConvoyTemplate / redConvoyTemplate at fromZoneName
+-- Drives to nearest FOB or first drop zone as fallback
+-- LOG._watchZoneConvoy polls every 30s for arrival
+```
+
+**Direct convoy** (auto-resupply and SAM resupply):
+```lua
+dispatchDirectConvoy(side, targetName, targetType, targetPos)
+-- Finds nearest HQ zone to targetPos
+-- Clones template, drives to targetPos using mist.groupToPoint
+-- LOG._watchDirectConvoy polls every 30s
+-- On arrival: calls LOG.resupply() or LOG.resupplySAM() based on targetType
+-- If convoy destroyed: 50% credit refund, clears _autoResupplyPending
+```
+
+`_watchDirectConvoy` re-reads target group's live position each poll cycle so
+it tracks displacing artillery batteries.
+
+#### Smart auto-resupply poll
+
+`autoResupplyPoll()` runs every `autoResupplyCheckInterval` seconds:
+
+1. Collects all batteries and SAMs below their threshold
+2. Sorts by urgency: WINCHESTER → CRITICAL → LOW
+3. Skips entries with `_autoResupplyPending[name] = true`
+4. Caps at `maxAutoConvoysPerSide` active auto-convoys per coalition
+5. Deducts `autoConvoyCost` or `samResupplyCost` credits via `DCSCore.credits.spendCredits()`
+6. Calls `dispatchDirectConvoy()`
+
+Only runs when `cfg.logistics.autoResupplyEnabled = true`.
+
+#### CTLD integration
+
+```lua
+LOG.onCrateDropped(args)           -- called by ctld_config crateDropped callback
+LOG._checkFOBBuilt(pos, side)      -- scans for static objects at crate pos after fobBuildTime
+LOG._scanForDeployedSAM(pos, side) -- scans for SAM radar attributes; calls iads.add() + initSAMAmmo()
+LOG._scanForDeployedJTAC(pos, side)-- scans for JTAC unit; registers with ArtilleryEnhancement + artillery_manager
+```
+
+FOB detection looks for DCS static objects (`world.searchObjects`) with SAM crate weight
+in `[1003.0, 1005.99]`.
+
+#### Pilot extraction
+
+`LOG._extractionHandler` listens for `S_EVENT_DEAD` on player aircraft.
+If `cfg.logistics.extractionEnabled` is true, calls `ctld.createExtractZone()` at the
+crash site.
+
+---
+
+### scripts/credits.lua — `DCSCore.credits`
+
+Kill-based resource economy.  Both coalitions maintain a credit pool.
+
+```lua
+CR.setup()
+CR.addCredits(side, amount, reason)   -- reason is logged only
+CR.spendCredits(side, amount)         -- returns false without deducting if insufficient
+CR.getCredits(side)
+CR.balanceStr()                       -- 'Credits — BLU: N  RED: N'
+```
+
+#### Kill value table (checked top-to-bottom; first attribute match wins)
+
+| Category | Credits |
+|---|---|
+| Aircraft Carriers | 300 |
+| Strategic bombers | 200 |
+| Battleships | 200 |
+| Fighters | 100 |
+| Helicopters | 75 |
+| SAM CC (command) | 120 |
+| SAM SR/TR (radar) | 100 |
+| SAM LL (launcher) | 75 |
+| Tanks | 60 |
+| MLRS | 70 |
+| Artillery | 50 |
+| IFV | 35 |
+| APC | 25 |
+| AAA | 30 |
+| Trucks | 10 |
+| Infantry | 5 |
+
+**Suppression-assist bonus:** +10 credits when a unit dies while
+`DCSCore.suppression.isSuppressed(groupName)` is true.
+
+**F10 menu** (both coalitions, all players): Balance, How Credits Work.
+
+---
+
+### scripts/artillery_manager.lua — `DCSCore.artillery`
+
+Counter-battery radar detection, fire missions, post-fire displacement.
+
+```lua
+ART.setup()
+ART.fireMission(batteryName, targetPos, rounds, msgSide)  -- wrapped by server_core
+ART.addSpotter(unitName, side)
+ART.addBattery(groupName, side)
+
+-- Internal state
+ART._batteries = {}  -- groupName -> { side, displacing, lastFired }
+ART._shells    = {}  -- tracked incoming shell objects
+```
+
+**server_core wire** — `wireLogisticsAmmo()` wraps `ART.fireMission`:
+1. Calls `LOG.hasAmmo(batteryName)` — aborts and notifies coalition if Winchester
+2. On success: calls `LOG.consumeAmmo(batteryName, rounds)`
+
+---
+
+### scripts/server_core.lua — Entry point (v1.2)
+
+Calls `*.setup()` in dependency order:
+
+```
+suppression → iads → ctld → artillery → logistics → credits
+```
+
+Then wires cross-system hooks:
+
+| Hook function | What it does |
+|---|---|
+| `wireIADSSuppression()` | Wraps `suppression._suppress`; extends SEAD dark window +15s if target is already evading |
+| `wireArtilleryCTLD()` | Confirms CB impact → CTLD zone warning link (no patch needed) |
+| `wireCTLDSuppression()` | Wraps `ctld.fallbackDrop` to call `onTroopDropHook` on success |
+| `wireLogisticsAmmo()` | Wraps `artillery.fireMission` for Winchester check + ammo deduction |
+
+Admin F10 menu (BLUE only) sections: IADS, Suppression, Artillery, CTLD, Logistics
+(including SAM ammo summary), Credits (balance display + admin grant commands).
+
+Status broadcast (every `statusInterval` seconds) reports: IADS evading count,
+suppressed group count, displacing batteries, logistics winchester counts (arty + SAM),
+credit balances.
+
+---
+
+### Cross-System Integration Map
+
+```
+SEAD missile fired
+  └─► iads_manager: SAM scatters + ALARM_STATE GREEN
+        └─► suppression hit while evading → dark window +15s
+
+Ground unit hit
+  └─► suppression: ROE WEAPON_HOLD for baseHoldTime
+        └─► if unit dies while suppressed → credits: +10 bonus to opposing side
+
+Artillery fires
+  └─► server_core wire: consumeAmmo() deducted from logistics pool
+        └─► if Winchester: fire blocked, player notified
+
+Artillery shell impacts
+  └─► artillery_manager: CB radar detects origin
+        ├─► suppression: units near impact suppressed
+        └─► nearest friendly battery fires CB mission
+
+SAM fires missiles
+  └─► logistics._samShotHandler: missiles decremented
+        ├─► LOW (<50%): coalition warned
+        ├─► CRITICAL (<25%): urgent warning
+        └─► WINCHESTER (0): ALARM_STATE GREEN + IADS 24hr dark
+
+Supply truck within supplyRadiusBattery (every 60s)
+  └─► logistics: battery rounds restored
+  └─► logistics: SAM missiles restored (if >120s since last shot)
+
+auto-resupply poll (every autoResupplyCheckInterval)
+  └─► logistics: batteries/SAMs below threshold → dispatchDirectConvoy
+        └─► credits.spendCredits() deducted
+              └─► on convoy destroyed: 50% refund
+
+CTLD crate dropped
+  └─► ctld_logistics: after fobBuildTime → scan for FOB
+  └─► ctld_logistics: after samBuildDelay → scan for SAM → iads.add() + initSAMAmmo()
+  └─► ctld_logistics: after jtacScanDelay → scan for JTAC → addSpotter()
+
+CTLD troop drop
+  └─► ctld_config.onTroopDropHook: enemies within 500m suppressed 20s
+
+Player aircraft killed
+  └─► logistics._extractionHandler: ctld.createExtractZone() at crash site
+
+Unit killed (S_EVENT_DEAD)
+  └─► credits._handler: award kill value to opposing coalition
+        └─► if suppressed: +10 assist bonus
+```
+
+---
+
+### Adding a New Module
+
+1. Create `scripts/mymodule.lua`:
+   ```lua
+   DCSCore         = DCSCore or {}
+   DCSCore.mymod   = {}
+   local M = DCSCore.mymod
+   local U = DCSCore.utils
+
+   function M.setup()
+       local cfg = DCSCore.config.mymod
+       if not cfg or not cfg.enabled then return end
+       -- ...
+       U.info('MYMOD: initialized')
+   end
+
+   U.info('mymod.lua loaded')
+   ```
+2. Add a `cfg.mymod` block to `scripts/config.lua`
+3. Add a `DO SCRIPT FILE` trigger in LOAD_ORDER.md (before `server_core.lua`)
+4. Add `DCSCore.mymod.setup()` to the init sequence in `server_core.lua`
+5. Add optional cross-system wiring in `server_core.lua` if needed
+
+### Namespace Conventions
+
+- All public functions on `DCSCore.*` (e.g. `DCSCore.logistics.resupply`)
+- Internal state/helpers prefixed with `_` (e.g. `LOG._batteries`, `LOG._watchDirectConvoy`)
+- Module local alias: `local M = DCSCore.mymod`; `local U = DCSCore.utils`
+- Config always read as `DCSCore.config.section` (never cached at module level)
+
+---
+
 ## Reference Links
 
 - SSE Docs: https://wiki.hoggitworld.com/view/Simulator_Scripting_Engine_Documentation
