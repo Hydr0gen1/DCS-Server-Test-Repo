@@ -211,6 +211,33 @@ cfg.logistics = {
 
     -- ── Downed-pilot extraction ────────────────────────────────
     extractionEnabled = true,
+
+    -- ── SAM ammo limits ───────────────────────────────────────
+    -- Each SAM launcher tracks its missile count.  When exhausted the
+    -- launcher goes dark until a supply convoy delivers a resupply.
+    samAmmoEnabled   = true,
+    samReloadDelay   = 60,     -- seconds after resupply before radar re-activates
+
+    -- ── Credit costs for logistics actions ────────────────────
+    manualConvoyCost  = 30,    -- credits to dispatch a player-requested convoy
+    autoConvoyCost    = 50,    -- credits for an auto-resupply convoy (battery)
+    samResupplyCost   = 75,    -- credits for an auto-resupply convoy (SAM)
+
+    -- ── Auto-resupply (smart convoy dispatch) ─────────────────
+    autoResupplyEnabled       = true,
+    autoResupplyThreshold     = 0.25,  -- battery rounds/max ratio that triggers auto
+    samAutoResupplyThreshold  = 0.25,  -- SAM missiles/max ratio that triggers auto
+    maxAutoConvoysPerSide     = 2,     -- max simultaneous auto-convoys per coalition
+    autoResupplyCheckInterval = 120,   -- seconds between auto-resupply polls
+}
+
+-- =============================================================
+-- Credits — resource economy
+-- =============================================================
+cfg.credits = {
+    enabled             = true,
+    blueStartingCredits = 500,   -- credits awarded to BLUE at mission start
+    redStartingCredits  = 500,   -- credits awarded to RED  at mission start
 }
 
 -- =============================================================

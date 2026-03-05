@@ -15,7 +15,8 @@
 --   9 s  → DO SCRIPT FILE  scripts/ctld_config.lua
 --  10 s  → DO SCRIPT FILE  scripts/ctld_logistics.lua
 --  11 s  → DO SCRIPT FILE  scripts/artillery_manager.lua
---  12 s  → DO SCRIPT FILE  scripts/server_core.lua   ← THIS FILE
+--  12 s  → DO SCRIPT FILE  scripts/credits.lua
+--  13 s  → DO SCRIPT FILE  scripts/server_core.lua   ← THIS FILE
 -- =============================================================
 
 DCSCore = DCSCore or {}
@@ -27,9 +28,9 @@ DCSCore = DCSCore or {}
 local function printBanner()
     local lines = {
         '==============================================',
-        '  DCS Server Core  v1.1',
+        '  DCS Server Core  v1.2',
         '  IADS | SmartSAM | Suppression | CTLD',
-        '  Logistics | Counter-Battery Arty',
+        '  Logistics | Counter-Battery Arty | Credits',
         '==============================================',
     }
     for _, l in ipairs(lines) do
@@ -46,7 +47,12 @@ local DEPS = {
     { label = 'IADScript',            global = 'iads',                 required = false },
     { label = 'ciribob CTLD',         global = 'ctld',                 required = false },
     { label = 'ArtilleryEnhancement', global = 'ArtilleryEnhancement', required = false },
-    { label = 'DCSCore.logistics',    global = nil,                    required = false },
+}
+
+-- Internal modules are checked separately (they use namespace, not _G key)
+local INTERNAL_MODS = {
+    { label = 'DCSCore.logistics', mod = function() return DCSCore.logistics end },
+    { label = 'DCSCore.credits',   mod = function() return DCSCore.credits   end },
 }
 
 local function reportDependencies()
@@ -57,6 +63,10 @@ local function reportDependencies()
                      or (d.required and '*** MISSING ***' or 'not loaded (optional)')
         env.info('[DCSCore] dep  ' .. d.label .. ': ' .. status)
         if d.required and not present then allOk = false end
+    end
+    for _, d in ipairs(INTERNAL_MODS) do
+        local present = (d.mod() ~= nil)
+        env.info('[DCSCore] mod  ' .. d.label .. ': ' .. (present and 'OK' or 'not loaded (optional)'))
     end
     return allOk
 end
@@ -272,6 +282,25 @@ local function buildAdminMenu()
             end)
 
         missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'SAM Ammo Summary', m, function()
+                local lines = { '[LOGISTICS] SAM Ammo:' }
+                local count = 0
+                for name, s in pairs(DCSCore.logistics._samAmmo) do
+                    if s.side == coalition.side.BLUE then
+                        count = count + 1
+                        table.insert(lines, string.format(
+                            '  %s  %d/%d  [%s]',
+                            name, s.missiles, s.maxMissiles, s.status))
+                    end
+                end
+                if count == 0 then
+                    table.insert(lines, '  (none tracked)')
+                end
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    table.concat(lines, '\n'), 25)
+            end)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
             'FOB / Convoy Status', m, function()
                 local fobs    = DCSCore.utils.tableLength(DCSCore.logistics._fobs)
                 local convoys = DCSCore.utils.tableLength(DCSCore.logistics._convoys)
@@ -279,6 +308,34 @@ local function buildAdminMenu()
                 DCSCore.utils.msgCoalition(coalition.side.BLUE,
                     string.format('[LOGISTICS] FOBs: %d  Convoys: %d  JTACs: %d',
                         fobs, convoys, jtacs), 12)
+            end)
+    end
+
+    -- ── Credits ───────────────────────────────────────────────
+    if DCSCore.credits then
+        local m = missionCommands.addSubMenuForCoalition(
+            coalition.side.BLUE, 'Credits', root)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'Balance (both sides)', m, function()
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    '[CREDITS] ' .. DCSCore.credits.balanceStr(), 12)
+            end)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'Add 100 to BLUE (admin)', m, function()
+                DCSCore.credits.addCredits(coalition.side.BLUE, 100, 'admin-grant')
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    '[CREDITS] +100 granted to BLUE. ' ..
+                    DCSCore.credits.balanceStr(), 10)
+            end)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'Add 100 to RED (admin)', m, function()
+                DCSCore.credits.addCredits(coalition.side.RED, 100, 'admin-grant')
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    '[CREDITS] +100 granted to RED. ' ..
+                    DCSCore.credits.balanceStr(), 10)
             end)
     end
 
@@ -321,11 +378,19 @@ local function startStatusBroadcast()
             for _, b in pairs(DCSCore.logistics._batteries) do
                 if b.rounds == 0 then winch = winch + 1 end
             end
+            local samWinch = 0
+            for _, s in pairs(DCSCore.logistics._samAmmo) do
+                if s.status == 'WINCHESTER' then samWinch = samWinch + 1 end
+            end
             local fobs    = DCSCore.utils.tableLength(DCSCore.logistics._fobs)
             local convoys = DCSCore.utils.tableLength(DCSCore.logistics._convoys)
             table.insert(parts,
                 'LOG fobs=' .. fobs .. ' convoys=' .. convoys ..
-                ' winchester=' .. winch)
+                ' winch=' .. winch .. ' samWinch=' .. samWinch)
+        end
+
+        if DCSCore.credits then
+            table.insert(parts, DCSCore.credits.balanceStr())
         end
 
         env.info(table.concat(parts, '  '))
@@ -383,6 +448,11 @@ local function init()
         DCSCore.logistics.setup()
     end
 
+    -- Credits must come after logistics (spend/refund hooks use logistics).
+    if DCSCore.credits then
+        DCSCore.credits.setup()
+    end
+
     -- ── Cross-system hooks ────────────────────────────────────
     wireIADSSuppression()
     wireArtilleryCTLD()
@@ -400,4 +470,4 @@ end
 -- Schedule one tick after load so all globals are settled
 timer.scheduleFunction(init, nil, timer.getTime() + 1)
 
-U.info('server_core.lua loaded — init scheduled')
+DCSCore.utils.info('server_core.lua loaded — init scheduled')

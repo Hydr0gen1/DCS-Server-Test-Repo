@@ -32,7 +32,8 @@ Time  Action               File
  9 s  DO SCRIPT FILE       scripts/ctld_config.lua
 10 s  DO SCRIPT FILE       scripts/ctld_logistics.lua
 11 s  DO SCRIPT FILE       scripts/artillery_manager.lua
-12 s  DO SCRIPT FILE       scripts/server_core.lua
+12 s  DO SCRIPT FILE       scripts/credits.lua
+13 s  DO SCRIPT FILE       scripts/server_core.lua
 ```
 
 > **Tip:** Place all `.lua` files in the same folder as your `.miz`, or use
@@ -178,17 +179,28 @@ Player aircraft killed
   │     └── Pending CB Shells
   ├── CTLD
   │     └── Lift Manifest
-  └── Logistics
-        ├── Ammo Summary
-        └── FOB / Convoy Status
+  ├── Logistics
+  │     ├── Ammo Summary
+  │     ├── SAM Ammo Summary
+  │     └── FOB / Convoy Status
+  └── Credits
+        ├── Balance (both sides)
+        ├── Add 100 to BLUE (admin)
+        └── Add 100 to RED (admin)
 
 Logistics                    (BLUE coalition, all players)
   ├── Ammo Status
+  ├── SAM Status
   ├── FOB Status
   ├── JTAC Status
   ├── Dispatch Convoy
   │     └── From <HQ Zone 1>  …
-  └── Convoy Status
+  ├── Convoy Status
+  └── Toggle Auto-Resupply
+
+Credits                      (both coalitions, all players)
+  ├── Balance
+  └── How Credits Work
 
 CTLD                         (built-in ciribob F10 menus)
   └── (standard CTLD menu — Actions, Load, Unload, Crates, etc.)
