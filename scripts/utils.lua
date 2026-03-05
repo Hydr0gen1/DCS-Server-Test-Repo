@@ -52,8 +52,12 @@ end
 
 --- Flat 2-D distance using DCS x/z axes.
 function U.dist2D(v1, v2)
+    -- DCS can provide horizontal coordinates as {x,z} (Vec3) or {x,y} (Vec2).
+    -- Treat Vec2.y as the horizontal "z" axis when .z is absent.
+    local z1 = (v1.z ~= nil) and v1.z or (v1.y or 0)
+    local z2 = (v2.z ~= nil) and v2.z or (v2.y or 0)
     local dx = v1.x - v2.x
-    local dz = (v1.z or 0) - (v2.z or 0)
+    local dz = z1 - z2
     return math.sqrt(dx * dx + dz * dz)
 end
 
@@ -80,7 +84,17 @@ end
 function U.getZoneVec3(zoneName)
     local zone = trigger.misc.getZone(zoneName)
     if not zone then return nil end
-    return { x = zone.point.x, y = zone.point.y, z = zone.point.z }
+
+    -- Some DCS APIs expose trigger-zone centers as Vec2 {x, y}, where y is
+    -- the horizontal map axis (equivalent to Vec3.z). Others provide Vec3.
+    if zone.point.z ~= nil then
+        -- Preserve explicit 3D altitude data when provided.
+        return { x = zone.point.x, y = zone.point.y, z = zone.point.z }
+    end
+
+    local z = zone.point.y
+    local y = land.getHeight({ x = zone.point.x, y = z })
+    return { x = zone.point.x, y = y, z = z }
 end
 
 --- Returns true when unit is inside the named trigger zone.
