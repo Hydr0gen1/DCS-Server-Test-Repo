@@ -2,7 +2,8 @@
 
 This project involves DCS World mission scripting using Lua via the Simulator Scripting Engine (SSE).
 The primary libraries and scripts referenced are: **MIST**, **IADScript**, **Baron's CSAR**, **Dynamic Medevac**,
-**Dynamic Extraction Team**, **Smarter SAM**, **Suppression Fire Script**, and **Artillery Enhancement Script**.
+**Dynamic Extraction Team**, **Smarter SAM**, **Suppression Fire Script**, **Artillery Enhancement Script**,
+and **Moose_DualCoalitionZoneCapture** (MOOSE-based dynamic zone capture).
 
 ---
 
@@ -618,6 +619,7 @@ DCSCore = {
     logistics  = {},   -- supply chain, SAM ammo, convoys (ctld_logistics.lua)
     credits    = {},   -- resource economy (credits.lua)
     artillery  = {},   -- counter-battery (artillery_manager.lua)
+    zoneCapture= {},   -- MOOSE zone capture integration (zone_capture.lua)
 }
 ```
 
@@ -627,19 +629,23 @@ correct order, then wires cross-system hooks via function wrapping.
 ### Load Order
 
 ```
- 1s  mist.lua                        (required)
- 2s  iads_v1_r37.lua                 (optional)
- 3s  ctld.lua                        (optional — ciribob CTLD)
- 4s  ArtilleryEnhancement.lua        (optional)
- 5s  scripts/utils.lua
- 6s  scripts/config.lua
- 7s  scripts/iads_manager.lua
- 8s  scripts/suppression.lua
- 9s  scripts/ctld_config.lua
-10s  scripts/ctld_logistics.lua
-11s  scripts/artillery_manager.lua
-12s  scripts/credits.lua
-13s  scripts/server_core.lua
+ 1s  mist.lua                                      (required)
+ 2s  MOOSE.lua                                     (optional — zone capture)
+ 3s  iads_v1_r37.lua                               (optional)
+ 4s  ctld.lua                                      (optional — ciribob CTLD)
+ 5s  ArtilleryEnhancement.lua                      (optional)
+ 6s  Moose_DualCoalitionZoneCapture.lua            (optional — zone capture)
+ 7s  Moose_DynamicGroundBattle_Plugin.lua          (optional — zone spawns)
+ 8s  scripts/utils.lua
+ 9s  scripts/config.lua
+10s  scripts/iads_manager.lua
+11s  scripts/suppression.lua
+12s  scripts/ctld_config.lua
+13s  scripts/ctld_logistics.lua
+14s  scripts/artillery_manager.lua
+15s  scripts/credits.lua
+16s  scripts/zone_capture.lua                      (optional — zone capture)
+17s  scripts/server_core.lua
 ```
 
 ---
@@ -900,6 +906,58 @@ crash site.
 
 ---
 
+### scripts/zone_capture.lua — `DCSCore.zoneCapture`
+
+Integration adapter between `Moose_DualCoalitionZoneCapture.lua` and the DCSCore
+system.  Requires MOOSE + `Moose_DualCoalitionZoneCapture.lua` loaded first.
+
+```lua
+ZC.setup()                 -- called by server_core; polls zoneCaptureObjects[]
+ZC.getZoneCoalition(name)  -- returns owning coalition side (0/1/2)
+ZC.getZoneStatus()         -- { [zoneName]={coalition,state,lastChange} }
+ZC.getZoneCounts()         -- { blue=N, red=N, neutral=N, contested=N }
+
+-- Internal state
+ZC._initialized = false
+ZC._zones = {}  -- zoneName -> { coalition, state, lastChange }
+```
+
+**Poll loop:** Runs every `cfg.zoneCapture.pollInterval` (default 15 s).
+Reads each `ZONE_CAPTURE_COALITION` object via MOOSE methods:
+- `:GetCoalition()` — current owner (0=neutral, 1=RED, 2=BLUE)
+- `:GetState()` — FSM state string ("Guarded"/"Attacked"/"Captured"/"Empty")
+- `:GetZone():GetName()` — zone name (falls back to `zoneNames[i]` parallel array)
+
+**Events fired on transitions:**
+
+| Transition | Action |
+|---|---|
+| Any state → Attacked | Suppress defenders in zone; award `attackCredits` to attackers |
+| Coalition changes (Captured) | Award `captureCredits`; outText broadcast; apply `zoneSAMPrefixes`; `_checkFOBBuilt`; optional artillery harassment |
+| Attacked → Guarded (same coalition) | Award `defenseCredits` to defender |
+| Any → Empty | Info log only |
+
+**Config section:** `cfg.zoneCapture` in `scripts/config.lua`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable the module |
+| `pollInterval` | `15` | Seconds between state polls |
+| `captureCredits` | `50` | Credits for capturing a zone |
+| `defenseCredits` | `25` | Credits for repelling an attack |
+| `attackCredits` | `5` | Credits for entering Attacked state |
+| `broadcastCaptures` | `true` | outText message on capture |
+| `zoneSAMPrefixes` | `{}` | Per-zone SAM IADS prefix table |
+| `suppressOnAttack` | `true` | Suppress defenders on Attacked |
+| `suppressRadius` | `800` | Metres around zone centre |
+| `suppressDuration` | `20` | Seconds of suppression |
+| `artilleryOnCapture` | `false` | Fire harassment on capture |
+| `artilleryTargetRadius` | `200` | Random offset for fire mission target |
+| `artilleryRoundsPerMission` | `5` | Rounds per harassment mission |
+| `fobOnCapture` | `true` | Scan zone centre for FOB static after capture |
+
+---
+
 ### scripts/credits.lua — `DCSCore.credits`
 
 Kill-based resource economy.  Both coalitions maintain a credit pool.
@@ -1036,6 +1094,23 @@ Player aircraft killed
 Unit killed (S_EVENT_DEAD)
   └─► credits._handler: award kill value to opposing coalition
         └─► if suppressed: +10 assist bonus
+
+─── Zone Capture poll (every cfg.zoneCapture.pollInterval seconds) ────────
+
+Zone enters "Attacked" state (MOOSE ZONE_CAPTURE_COALITION poll)
+  └─► zone_capture: defenders inside zone → suppression.suppressGroup()
+  └─► zone_capture: attackCredits awarded to attacking coalition
+
+Zone captured (GetCoalition() changes)
+  └─► zone_capture: captureCredits awarded to capturing coalition
+  └─► zone_capture: trigger.action.outText() all-coalition broadcast
+  └─► zone_capture: zoneSAMPrefixes → iads.addAllByPrefix() for new owner
+  └─► zone_capture: logistics._checkFOBBuilt() at zone centre
+  └─► zone_capture (if artilleryOnCapture): artillery.fireMission() harassment
+        └─► wireLogisticsAmmo: ammo deducted + Winchester check applied
+
+Zone defended (Attacked → Guarded, same coalition)
+  └─► zone_capture: defenseCredits awarded to defending coalition
 ```
 
 ---

@@ -5,18 +5,22 @@
 --
 -- LOAD ORDER (Mission Editor triggers — Time More):
 --   1 s  → DO SCRIPT FILE  mist.lua
---   2 s  → DO SCRIPT FILE  iads_v1_r37.lua         (optional)
---   3 s  → DO SCRIPT FILE  ctld.lua                (optional — ciribob CTLD)
---   4 s  → DO SCRIPT FILE  ArtilleryEnhancement.lua (optional)
---   5 s  → DO SCRIPT FILE  scripts/utils.lua
---   6 s  → DO SCRIPT FILE  scripts/config.lua
---   7 s  → DO SCRIPT FILE  scripts/iads_manager.lua
---   8 s  → DO SCRIPT FILE  scripts/suppression.lua
---   9 s  → DO SCRIPT FILE  scripts/ctld_config.lua
---  10 s  → DO SCRIPT FILE  scripts/ctld_logistics.lua
---  11 s  → DO SCRIPT FILE  scripts/artillery_manager.lua
---  12 s  → DO SCRIPT FILE  scripts/credits.lua
---  13 s  → DO SCRIPT FILE  scripts/server_core.lua   ← THIS FILE
+--   2 s  → DO SCRIPT FILE  MOOSE.lua                          (optional — zone capture)
+--   3 s  → DO SCRIPT FILE  iads_v1_r37.lua                    (optional)
+--   4 s  → DO SCRIPT FILE  ctld.lua                           (optional — ciribob CTLD)
+--   5 s  → DO SCRIPT FILE  ArtilleryEnhancement.lua           (optional)
+--   6 s  → DO SCRIPT FILE  Moose_DualCoalitionZoneCapture.lua (optional)
+--   7 s  → DO SCRIPT FILE  Moose_DynamicGroundBattle_Plugin.lua (optional)
+--   8 s  → DO SCRIPT FILE  scripts/utils.lua
+--   9 s  → DO SCRIPT FILE  scripts/config.lua
+--  10 s  → DO SCRIPT FILE  scripts/iads_manager.lua
+--  11 s  → DO SCRIPT FILE  scripts/suppression.lua
+--  12 s  → DO SCRIPT FILE  scripts/ctld_config.lua
+--  13 s  → DO SCRIPT FILE  scripts/ctld_logistics.lua
+--  14 s  → DO SCRIPT FILE  scripts/artillery_manager.lua
+--  15 s  → DO SCRIPT FILE  scripts/credits.lua
+--  16 s  → DO SCRIPT FILE  scripts/zone_capture.lua            (optional — zone capture)
+--  17 s  → DO SCRIPT FILE  scripts/server_core.lua              ← THIS FILE
 -- =============================================================
 
 DCSCore = DCSCore or {}
@@ -28,9 +32,10 @@ DCSCore = DCSCore or {}
 local function printBanner()
     local lines = {
         '==============================================',
-        '  DCS Server Core  v1.2',
+        '  DCS Server Core  v1.3',
         '  IADS | SmartSAM | Suppression | CTLD',
-        '  Logistics | Counter-Battery Arty | Credits',
+        '  Logistics | Counter-Battery | Credits',
+        '  Zone Capture Integration',
         '==============================================',
     }
     for _, l in ipairs(lines) do
@@ -47,12 +52,14 @@ local DEPS = {
     { label = 'IADScript',            global = 'iads',                 required = false },
     { label = 'ciribob CTLD',         global = 'ctld',                 required = false },
     { label = 'ArtilleryEnhancement', global = 'ArtilleryEnhancement', required = false },
+    { label = 'MOOSE Zone Capture',   global = 'zoneCaptureObjects',   required = false },
 }
 
 -- Internal modules are checked separately (they use namespace, not _G key)
 local INTERNAL_MODS = {
-    { label = 'DCSCore.logistics', mod = function() return DCSCore.logistics end },
-    { label = 'DCSCore.credits',   mod = function() return DCSCore.credits   end },
+    { label = 'DCSCore.logistics',   mod = function() return DCSCore.logistics   end },
+    { label = 'DCSCore.credits',     mod = function() return DCSCore.credits     end },
+    { label = 'DCSCore.zoneCapture', mod = function() return DCSCore.zoneCapture end },
 }
 
 local function reportDependencies()
@@ -134,6 +141,19 @@ local function wireLogisticsAmmo()
     end
 
     DCSCore.utils.info('CORE: Artillery <-> Logistics ammo hook wired')
+end
+
+--- Zone capture events (capture, defence, attack) feed credits, suppression,
+--- logistics FOB scanning, and artillery harassment automatically via the
+--- zone_capture.lua module's poll loop.  This wire simply confirms the
+--- artillery.fireMission path is already patched by wireLogisticsAmmo().
+local function wireZoneCaptureIntegration()
+    if not DCSCore.zoneCapture then return end
+    -- zone_capture.lua calls DCSCore.credits / suppression / logistics / artillery
+    -- APIs directly at event time.  wireLogisticsAmmo() (below) has already
+    -- wrapped artillery.fireMission with the Winchester + ammo-deduction check,
+    -- so harassment fire missions automatically go through the logistics gate.
+    DCSCore.utils.info('CORE: ZoneCapture <-> Credits/Suppression/Logistics/IADS wired')
 end
 
 --- After a CTLD troop drop the helicopter's approach suppresses nearby enemies.
@@ -311,6 +331,58 @@ local function buildAdminMenu()
             end)
     end
 
+    -- ── Zone Capture ──────────────────────────────────────────
+    if DCSCore.zoneCapture and DCSCore.zoneCapture._initialized then
+        local m = missionCommands.addSubMenuForCoalition(
+            coalition.side.BLUE, 'Zone Capture', root)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'Zone Status', m, function()
+                local counts = DCSCore.zoneCapture.getZoneCounts()
+                local lines  = {
+                    string.format('[ZONE] BLU:%d  RED:%d  Neutral:%d  Contested:%d',
+                        counts.blue, counts.red, counts.neutral, counts.contested)
+                }
+                for name, data in pairs(DCSCore.zoneCapture._zones) do
+                    local owner
+                    if data.coalition == coalition.side.BLUE then owner = 'BLU'
+                    elseif data.coalition == coalition.side.RED then owner = 'RED'
+                    else owner = 'NEU' end
+                    table.insert(lines, string.format('  %-24s [%s] %s',
+                        name, owner, data.state or '?'))
+                end
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    table.concat(lines, '\n'), 30)
+            end)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'Toggle Broadcasts', m, function()
+                local c = DCSCore.config.zoneCapture
+                c.broadcastCaptures = not c.broadcastCaptures
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    '[ZONE] Capture broadcasts ' ..
+                    (c.broadcastCaptures and 'ENABLED' or 'DISABLED'), 8)
+            end)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'Toggle Suppress-on-Attack', m, function()
+                local c = DCSCore.config.zoneCapture
+                c.suppressOnAttack = not c.suppressOnAttack
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    '[ZONE] Suppress-on-attack ' ..
+                    (c.suppressOnAttack and 'ENABLED' or 'DISABLED'), 8)
+            end)
+
+        missionCommands.addCommandForCoalition(coalition.side.BLUE,
+            'Toggle Arty Harassment', m, function()
+                local c = DCSCore.config.zoneCapture
+                c.artilleryOnCapture = not c.artilleryOnCapture
+                DCSCore.utils.msgCoalition(coalition.side.BLUE,
+                    '[ZONE] Artillery harassment ' ..
+                    (c.artilleryOnCapture and 'ENABLED' or 'DISABLED'), 8)
+            end)
+    end
+
     -- ── Credits ───────────────────────────────────────────────
     if DCSCore.credits then
         local m = missionCommands.addSubMenuForCoalition(
@@ -389,6 +461,13 @@ local function startStatusBroadcast()
                 ' winch=' .. winch .. ' samWinch=' .. samWinch)
         end
 
+        if DCSCore.zoneCapture and DCSCore.zoneCapture._initialized then
+            local counts = DCSCore.zoneCapture.getZoneCounts()
+            table.insert(parts,
+                string.format('ZONES blu=%d red=%d neut=%d cont=%d',
+                    counts.blue, counts.red, counts.neutral, counts.contested))
+        end
+
         if DCSCore.credits then
             table.insert(parts, DCSCore.credits.balanceStr())
         end
@@ -453,11 +532,18 @@ local function init()
         DCSCore.credits.setup()
     end
 
+    -- Zone capture must come after credits, suppression, logistics, and artillery
+    -- are all set up so that the poll-loop hooks have live systems to call into.
+    if DCSCore.zoneCapture then
+        DCSCore.zoneCapture.setup()
+    end
+
     -- ── Cross-system hooks ────────────────────────────────────
     wireIADSSuppression()
     wireArtilleryCTLD()
     wireCTLDSuppression()
     wireLogisticsAmmo()
+    wireZoneCaptureIntegration()
 
     -- ── Admin UI & status ─────────────────────────────────────
     buildAdminMenu()

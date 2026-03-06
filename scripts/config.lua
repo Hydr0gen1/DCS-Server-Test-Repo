@@ -284,4 +284,59 @@ cfg.artillery = {
     cbHoldTime           = 30,   -- seconds of suppression applied
 }
 
+-- =============================================================
+-- Zone Capture — Moose_DualCoalitionZoneCapture integration
+-- Requires: MOOSE.lua + Moose_DualCoalitionZoneCapture.lua
+-- =============================================================
+cfg.zoneCapture = {
+    enabled = true,
+
+    -- Seconds between zone-state poll cycles.
+    -- Lower = more responsive (finer detection); higher = less CPU overhead.
+    pollInterval = 15,
+
+    -- ── Credit rewards ───────────────────────────────────────
+    captureCredits = 50,   -- awarded to the coalition that captures a zone
+    defenseCredits = 25,   -- awarded when a zone is successfully defended
+                           --   (state: Attacked → Guarded, coalition unchanged)
+    attackCredits  = 5,    -- awarded to attacker when a zone enters Attacked
+
+    -- ── Broadcast ─────────────────────────────────────────────
+    -- Send an all-coalition outText message on each capture event.
+    broadcastCaptures = true,
+
+    -- ── Zone-specific SAM IADS prefixes ───────────────────────
+    -- When a zone is captured, SAM groups whose names start with any
+    -- listed prefix are added to the new owner's IADS network.
+    -- Configure per zone name (must match ME trigger zone name exactly).
+    -- Example:
+    --   zoneSAMPrefixes = {
+    --     ['Capture Zone-1'] = { 'SA6-North-', 'TOR-North-' },
+    --     ['Capture Zone-2'] = { 'HAWK-East-' },
+    --   },
+    zoneSAMPrefixes = {},
+
+    -- ── Defender suppression on attack ────────────────────────
+    -- When a zone enters "Attacked" state, friendly units inside are
+    -- briefly suppressed (ROE → WEAPON_HOLD) to simulate assault chaos.
+    -- Requires DCSCore.suppression to be loaded.
+    suppressOnAttack = true,
+    suppressRadius   = 800,  -- metres around zone centre to scan for defenders
+    suppressDuration = 20,   -- seconds of suppression applied
+
+    -- ── Artillery harassment on capture ───────────────────────
+    -- When a zone is captured, the former owner fires a short harassment
+    -- mission at the zone centre from its nearest available battery.
+    -- Requires DCSCore.artillery + DCSCore.logistics to be loaded.
+    artilleryOnCapture        = false,
+    artilleryTargetRadius     = 200,  -- metres of random offset from zone centre
+    artilleryRoundsPerMission = 5,
+
+    -- ── Logistics FOB registration on capture ─────────────────
+    -- After a zone is captured, scan the zone centre for static objects
+    -- that qualify as a FOB and register them with the logistics system.
+    -- Requires DCSCore.logistics to be loaded.
+    fobOnCapture = true,
+}
+
 DCSCore.utils.info('config.lua loaded')

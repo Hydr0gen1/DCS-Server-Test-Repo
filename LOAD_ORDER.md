@@ -8,6 +8,9 @@ Use a separate trigger action per file with incrementing **Time More** values.
 | Script | Source | Required? |
 |---|---|---|
 | `mist.lua` | [MIST GitHub](https://github.com/mrSkortch/MissionScriptingTools) | **Yes** |
+| `MOOSE.lua` | [MOOSE GitHub](https://github.com/FlightControl-Master/MOOSE) | No (Zone Capture features) |
+| `Moose_DualCoalitionZoneCapture.lua` | [iTracerFacer GitHub](https://github.com/iTracerFacer/Moose_DualCoalitionZoneCapture) | No (Zone Capture features) |
+| `Moose_DynamicGroundBattle_Plugin.lua` | Same repo as above | No (dynamic ground spawns) |
 | `ctld.lua` | [ciribob CTLD](https://github.com/ciribob/DCS-CTLD) | No — but strongly recommended |
 | `iads_v1_r37.lua` | [Hoggit IADS Docs](https://wiki.hoggitworld.com/view/IADScript_Documentation) | No (IADS features) |
 | `ArtilleryEnhancement.lua` | ED Forums (Grimes) | No (enhanced arty AI) |
@@ -22,22 +25,30 @@ Create one trigger per row. All are **ONCE / Time More**.
 Time  Action               File
 ────  ───────────────────  ─────────────────────────────────────────────
  1 s  DO SCRIPT FILE       mist.lua
- 2 s  DO SCRIPT FILE       iads_v1_r37.lua              (optional)
- 3 s  DO SCRIPT FILE       ctld.lua                     (optional)
- 4 s  DO SCRIPT FILE       ArtilleryEnhancement.lua     (optional)
- 5 s  DO SCRIPT FILE       scripts/utils.lua
- 6 s  DO SCRIPT FILE       scripts/config.lua
- 7 s  DO SCRIPT FILE       scripts/iads_manager.lua
- 8 s  DO SCRIPT FILE       scripts/suppression.lua
- 9 s  DO SCRIPT FILE       scripts/ctld_config.lua
-10 s  DO SCRIPT FILE       scripts/ctld_logistics.lua
-11 s  DO SCRIPT FILE       scripts/artillery_manager.lua
-12 s  DO SCRIPT FILE       scripts/credits.lua
-13 s  DO SCRIPT FILE       scripts/server_core.lua
+ 2 s  DO SCRIPT FILE       MOOSE.lua                    (optional — zone capture)
+ 3 s  DO SCRIPT FILE       iads_v1_r37.lua              (optional)
+ 4 s  DO SCRIPT FILE       ctld.lua                     (optional)
+ 5 s  DO SCRIPT FILE       ArtilleryEnhancement.lua     (optional)
+ 6 s  DO SCRIPT FILE       Moose_DualCoalitionZoneCapture.lua    (optional)
+ 7 s  DO SCRIPT FILE       Moose_DynamicGroundBattle_Plugin.lua  (optional)
+ 8 s  DO SCRIPT FILE       scripts/utils.lua
+ 9 s  DO SCRIPT FILE       scripts/config.lua
+10 s  DO SCRIPT FILE       scripts/iads_manager.lua
+11 s  DO SCRIPT FILE       scripts/suppression.lua
+12 s  DO SCRIPT FILE       scripts/ctld_config.lua
+13 s  DO SCRIPT FILE       scripts/ctld_logistics.lua
+14 s  DO SCRIPT FILE       scripts/artillery_manager.lua
+15 s  DO SCRIPT FILE       scripts/credits.lua
+16 s  DO SCRIPT FILE       scripts/zone_capture.lua     (optional — zone capture)
+17 s  DO SCRIPT FILE       scripts/server_core.lua
 ```
 
 > **Tip:** Place all `.lua` files in the same folder as your `.miz`, or use
 > absolute paths if the server has a fixed Saved Games directory.
+>
+> **MOOSE note:** MOOSE.lua is large (~5 MB). It must load before
+> `Moose_DualCoalitionZoneCapture.lua`. Give MOOSE a 1–2 s head-start if
+> you observe initialisation errors.
 
 ## Minimum Viable Load (no external scripts)
 
@@ -45,11 +56,11 @@ Suppression + built-in counter-battery only:
 
 ```
 1 s   mist.lua
-5 s   scripts/utils.lua
-6 s   scripts/config.lua
-8 s   scripts/suppression.lua
-11 s  scripts/artillery_manager.lua
-12 s  scripts/server_core.lua
+8 s   scripts/utils.lua
+9 s   scripts/config.lua
+11 s  scripts/suppression.lua
+14 s  scripts/artillery_manager.lua
+17 s  scripts/server_core.lua
 ```
 
 Modules not loaded are silently skipped by `server_core.lua`.
@@ -162,6 +173,24 @@ CTLD JTAC crate assembled (jtacScanDelay after drop)
 
 Player aircraft killed
   └─► ctld_logistics: extraction zone created at crash site
+
+─── Zone Capture (every pollInterval seconds) ─────────────────
+
+Zone enters "Attacked" state
+  └─► zone_capture: defenders inside zone suppressed (suppressDuration s)
+  └─► zone_capture: attackCredits awarded to attacking coalition
+
+Zone captured (coalition changes)
+  └─► zone_capture: captureCredits awarded to capturing coalition
+  └─► zone_capture: all-coalition outText broadcast
+  └─► zone_capture: zone-specific SAM prefixes added to capturing side's IADS
+  └─► zone_capture: logistics._checkFOBBuilt() called at zone position
+  └─► zone_capture (if artilleryOnCapture=true):
+        └─► artillery_manager.fireMission() on zone centre (nearest old-owner battery)
+              └─► wireLogisticsAmmo: ammo deducted, Winchester check applied
+
+Zone defended (Attacked → Guarded, same coalition)
+  └─► zone_capture: defenseCredits awarded to defending coalition
 ```
 
 ## F10 Menu Layout
@@ -183,6 +212,11 @@ Player aircraft killed
   │     ├── Ammo Summary
   │     ├── SAM Ammo Summary
   │     └── FOB / Convoy Status
+  ├── Zone Capture            (only present when zone_capture.lua is loaded)
+  │     ├── Zone Status
+  │     ├── Toggle Broadcasts
+  │     ├── Toggle Suppress-on-Attack
+  │     └── Toggle Arty Harassment
   └── Credits
         ├── Balance (both sides)
         ├── Add 100 to BLUE (admin)
